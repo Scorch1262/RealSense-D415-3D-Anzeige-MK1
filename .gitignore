@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+build/version_info.txt
+build/*/
+dist/
+release/
+*.spec
+config.ini
+*.ply

@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{{APP_NAME}}</title>
+<link rel="icon" type="image/svg+xml" href="/static/logo.svg">
+<link rel="stylesheet" href="/static/style.css">
+<script type="importmap">
+{ "imports": { "three": "/static/vendor/three.module.min.js" } }
+</script>
+</head>
+<body>
+<header class="topbar">
+  <button class="icon-btn only-mobile" id="btnMenu" title="Menü">
+    <svg viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+  </button>
+  <div class="brand">
+    <img src="/static/logo.svg" alt="" class="brand-logo">
+    <div class="brand-text">
+      <div class="brand-title">REALSENSE<span class="dim">-VIEWER</span></div>
+      <div class="brand-sub">MK1 · D415 TIEFENKAMERA · v{{VERSION}}</div>
+    </div>
+  </div>
+
+  <nav class="tabs" id="viewTabs">
+    <button data-view="3d" class="active">3D</button>
+    <button data-view="tiefe">TIEFE</button>
+    <button data-view="farbe">FARBE</button>
+    <button data-view="geteilt">GETEILT</button>
+  </nav>
+
+  <div class="top-status">
+    <div class="pill" id="pillCam"><span class="dot"></span><span id="pillCamText">SUCHE</span></div>
+    <div class="pill mono" id="pillFps">— FPS</div>
+    <div class="clock mono" id="clock">--:--:--</div>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+
+    <section class="panel">
+      <h3><span class="tick"></span>GERÄT</h3>
+      <dl class="kv">
+        <dt>Modell</dt><dd id="devName">—</dd>
+        <dt>Seriennr.</dt><dd id="devSerial" class="mono">—</dd>
+        <dt>Firmware</dt><dd id="devFw" class="mono">—</dd>
+        <dt>USB</dt><dd id="devUsb" class="mono">—</dd>
+        <dt>Stream</dt><dd id="devStream" class="mono">—</dd>
+        <dt>Temperatur</dt><dd id="devTemp" class="mono">—</dd>
+        <dt>SDK</dt><dd id="devSdk" class="mono">—</dd>
+      </dl>
+    </section>
+
+    <section class="panel">
+      <h3><span class="tick"></span>KAMERA</h3>
+      <label class="field">
+        <span>Auflösung</span>
+        <select id="selRes"></select>
+      </label>
+      <label class="field">
+        <span>Bildrate</span>
+        <select id="selFps"></select>
+      </label>
+      <label class="field">
+        <span>Betriebsart</span>
+        <select id="selMode">
+          <option value="auto">Automatisch (Demo ohne Kamera)</option>
+          <option value="nein">Nur Kamera</option>
+          <option value="ja">Demo-Szene</option>
+        </select>
+      </label>
+      <div class="cam-only" id="camOptions">
+        <label class="toggle"><input type="checkbox" id="chkLaser"><i></i><span>IR-Projektor (Laser)</span></label>
+        <label class="field">
+          <span>Laserleistung <b class="mono" id="lblLaser">—</b></span>
+          <input type="range" id="rngLaser" min="0" max="360" step="30">
+        </label>
+        <label class="field">
+          <span>Preset</span>
+          <select id="selPreset"></select>
+        </label>
+      </div>
+      <div class="hint" id="camHint">Optionen nur mit angeschlossener Kamera.</div>
+      <button class="btn" id="btnCamRestart">Kamera neu verbinden</button>
+    </section>
+
+    <section class="panel">
+      <h3><span class="tick"></span>VERARBEITUNG</h3>
+      <div class="field">
+        <span>Punktabstand (Pixel)</span>
+        <div class="seg" id="segStep">
+          <button data-v="1">1</button><button data-v="2">2</button>
+          <button data-v="3">3</button><button data-v="4">4</button>
+        </div>
+      </div>
+      <label class="toggle"><input type="checkbox" id="chkSpatial"><i></i><span>Glättung (räumlich)</span></label>
+      <label class="toggle"><input type="checkbox" id="chkTemporal"><i></i><span>Glättung (zeitlich)</span></label>
+      <label class="toggle"><input type="checkbox" id="chkHoles"><i></i><span>Löcher füllen</span></label>
+      <label class="field">
+        <span>Min. Distanz <b class="mono" id="lblMin">—</b></span>
+        <input type="range" id="rngMin" min="0" max="3" step="0.05">
+      </label>
+      <label class="field">
+        <span>Max. Distanz <b class="mono" id="lblMax">—</b></span>
+        <input type="range" id="rngMax" min="0.3" max="10" step="0.1">
+      </label>
+    </section>
+
+    <section class="panel">
+      <h3><span class="tick"></span>DARSTELLUNG</h3>
+      <div class="field">
+        <span>Punktfarbe</span>
+        <div class="seg" id="segColor">
+          <button data-v="rgb">RGB</button><button data-v="tiefe">TIEFE</button>
+          <button data-v="amber">AMBER</button><button data-v="teal">TEAL</button>
+        </div>
+      </div>
+      <label class="field">
+        <span>Punktgröße <b class="mono" id="lblSize">—</b></span>
+        <input type="range" id="rngSize" min="0.5" max="8" step="0.5">
+      </label>
+      <label class="toggle"><input type="checkbox" id="chkGrid"><i></i><span>Bodenraster</span></label>
+      <label class="toggle"><input type="checkbox" id="chkAxes"><i></i><span>Kamera &amp; Achsen</span></label>
+      <div class="field">
+        <span>Blickwinkel</span>
+        <div class="seg" id="segCam">
+          <button data-v="kamera">KAMERA</button><button data-v="schraeg">SCHRÄG</button>
+          <button data-v="oben">OBEN</button><button data-v="seite">SEITE</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h3><span class="tick"></span>AUFNAHME</h3>
+      <div class="btn-row">
+        <button class="btn" id="btnFreeze">Einfrieren</button>
+        <button class="btn" id="btnShot">Bild (PNG)</button>
+      </div>
+      <button class="btn accent" id="btnPly">Punktwolke speichern (PLY)</button>
+    </section>
+
+    <section class="panel">
+      <h3><span class="tick"></span>SYSTEM</h3>
+      <label class="field">
+        <span>Webseiten-Port <b class="mono" id="lblPortActive"></b></span>
+        <div class="inline">
+          <input type="number" id="inpPort" min="1" max="65535">
+          <button class="btn small" id="btnPort">Speichern</button>
+        </div>
+      </label>
+      <div class="hint mono" id="cfgPath"></div>
+    </section>
+  </aside>
+
+  <main class="stage view-3d" id="stage">
+    <div class="pane pane-3d" id="pane3d">
+      <div class="hud-corners"><i></i><i></i><i></i><i></i></div>
+      <div class="pane-label">PUNKTWOLKE · 3D</div>
+      <div class="hud-bl mono" id="hud3d">—</div>
+      <div class="hud-br mono">LMB DREHEN · RMB VERSCHIEBEN · RAD ZOOM</div>
+      <div class="colorbar" id="colorbar"><span id="cbMax"></span><div class="bar"></div><span id="cbMin"></span></div>
+      <div class="badge-demo" id="badgeDemo">DEMO-SZENE</div>
+      <div class="frozen" id="badgeFrozen">EINGEFROREN</div>
+      <div class="nosignal" id="noSignal"><div>KEIN SIGNAL</div><small id="noSignalText">Warte auf Kamera …</small></div>
+    </div>
+    <div class="pane pane-2d" id="paneDepth">
+      <div class="hud-corners"><i></i><i></i><i></i><i></i></div>
+      <div class="pane-label">TIEFENBILD</div>
+      <canvas id="cvDepth"></canvas>
+      <div class="hud-bl mono" id="hudDepth">—</div>
+    </div>
+    <div class="pane pane-2d" id="paneColor">
+      <div class="hud-corners"><i></i><i></i><i></i><i></i></div>
+      <div class="pane-label">FARBBILD · AUSGERICHTET</div>
+      <canvas id="cvColor"></canvas>
+      <div class="hud-bl mono" id="hudColor">—</div>
+    </div>
+  </main>
+</div>
+
+<footer class="statusbar">
+  <span class="mono" id="sbMsg">Starte …</span>
+  <span class="spacer"></span>
+  <span class="mono" id="sbRate">— KB/s</span>
+  <span class="mono ver">{{APP_NAME}} v{{VERSION}}</span>
+</footer>
+
+<div class="toast" id="toast"></div>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
