@@ -6,4 +6,6 @@ dist/
 release/
 *.spec
 config.ini
+selbsttest.txt
+realsense-viewer.log
 *.ply

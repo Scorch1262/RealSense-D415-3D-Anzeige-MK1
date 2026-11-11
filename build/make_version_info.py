@@ -17,7 +17,7 @@ VSVersionInfo(
                     fileType=0x1, subtype=0x0, date=(0, 0)),
   kids=[
     StringFileInfo([StringTable('040704B0', [
-      StringStruct('FileDescription', '{name} - 3D-Ansicht fuer Intel RealSense D415'),
+      StringStruct('FileDescription', '{name} - 3D-Ansicht fuer Intel RealSense D415 (Desktop)'),
       StringStruct('FileVersion', '{version}'),
       StringStruct('InternalName', '{name}'),
       StringStruct('OriginalFilename', '{name}.exe'),

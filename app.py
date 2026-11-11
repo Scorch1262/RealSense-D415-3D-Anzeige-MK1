@@ -1,756 +1,1275 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RealSense-Viewer-MK1
+RealSense-Viewer-MK1 – Desktop-Programm
 Zeigt das 3D-Bild (Punktwolke), das Tiefenbild und das Farbbild einer per USB
-angeschlossenen Intel RealSense D415 im Browser an – im Design der Dashboards.
-
-Start:  python app.py          (oder die gebaute RealSense-Viewer-MK1.exe)
-Danach: http://localhost:8095  (Port in config.ini bzw. auf der Webseite änderbar)
+angeschlossenen Intel RealSense D415 in einem eigenen Programmfenster an
+(Qt/PySide6 + OpenGL), im Design der Dashboards.
 """
 
-import configparser
-import json
 import logging
-import math
 import os
-import struct
 import sys
-import threading
 import time
-import webbrowser
 from pathlib import Path
 
-import numpy as np
-from flask import Flask, Response, jsonify, request, send_from_directory
-
-try:
-    import pyrealsense2 as rs
-    RS_IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - nur ohne SDK
-    rs = None
-    RS_IMPORT_ERROR = str(exc)
-
 APP_NAME = "RealSense-Viewer-MK1"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
+
+import numpy as np  # noqa: E402
+
+import kamera  # noqa: E402
+from kamera import (AUFLOESUNGEN, ASSET_DIR, BASE_DIR, CONFIG_PATH, FPS_WERTE,  # noqa: E402
+                    CameraWorker, cfg_get, cfg_save, cfg_set, truthy)
 
 # --------------------------------------------------------------------------
-# Pfade: Ressourcen (im exe eingebettet) und Konfiguration (neben der exe)
+# Protokoll in Datei (bei Fenster-exe gibt es keine Konsole)
 # --------------------------------------------------------------------------
-if getattr(sys, "frozen", False):
-    BASE_DIR = Path(sys.executable).resolve().parent
-    RES_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR))
-else:
-    BASE_DIR = Path(__file__).resolve().parent
-    RES_DIR = BASE_DIR
-
-STATIC_DIR = RES_DIR / "static"
-CONFIG_PATH = BASE_DIR / "config.ini"
-
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(errors="replace")
-    except Exception:
-        pass
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s %(message)s",
-                    datefmt="%H:%M:%S")
+LOG_PATH = BASE_DIR / "realsense-viewer.log"
+_handlers = []
+try:
+    _handlers.append(logging.FileHandler(LOG_PATH, mode="w", encoding="utf-8"))
+except Exception:
+    pass
+if sys.stderr is not None:
+    _handlers.append(logging.StreamHandler(sys.stderr))
+logging.basicConfig(level=logging.WARNING, handlers=_handlers or [logging.NullHandler()],
+                    format="%(asctime)s  %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(APP_NAME)
-logging.getLogger("werkzeug").setLevel(logging.WARNING)
-
-# --------------------------------------------------------------------------
-# Konfiguration
-# --------------------------------------------------------------------------
-DEFAULTS = {
-    "server": {
-        "port": "8095",
-        "host": "0.0.0.0",
-        "browser_oeffnen": "ja",
-    },
-    "kamera": {
-        "aufloesung": "848x480",
-        "fps": "30",
-        "seriennummer": "",
-        "demo_modus": "auto",          # auto | ja | nein
-        "laser": "ja",
-        "laserleistung": "150",
-        "preset": "",
-    },
-    "verarbeitung": {
-        "punktabstand": "2",           # 1 = jeder Pixel, 2 = jeder zweite ...
-        "spatial_filter": "ja",
-        "temporal_filter": "ja",
-        "loecher_fuellen": "nein",
-        "min_distanz_m": "0.15",
-        "max_distanz_m": "3.0",
-    },
-    "ansicht": {
-        "farbmodus": "rgb",            # rgb | tiefe | amber | teal
-        "punktgroesse": "2.0",
-        "ansicht": "3d",               # 3d | tiefe | farbe | geteilt
-        "gitter": "ja",
-        "achsen": "ja",
-    },
-}
-
-AUFLOESUNGEN = ["1280x720", "848x480", "640x480", "640x360", "480x270", "424x240"]
-FPS_WERTE = [6, 15, 30]
-
-_cfg_lock = threading.Lock()
-
-
-def _truthy(v):
-    return str(v).strip().lower() in ("1", "ja", "yes", "true", "an", "on")
-
-
-def load_config():
-    cfg = configparser.ConfigParser()
-    cfg.read_dict(DEFAULTS)
-    if CONFIG_PATH.exists():
-        try:
-            cfg.read(CONFIG_PATH, encoding="utf-8")
-        except Exception as exc:
-            log.warning("config.ini konnte nicht gelesen werden (%s) – nutze Standardwerte", exc)
-    else:
-        save_config(cfg)
-    return cfg
-
-
-def save_config(cfg):
-    header = (
-        f"# {APP_NAME} – Konfiguration\n"
-        "# Diese Datei liegt neben der exe und kann mit jedem Texteditor bearbeitet werden.\n"
-        "# Werte für ja/nein: ja | nein.  Nach Änderung des Ports Programm neu starten.\n\n"
-    )
-    try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
-            fh.write(header)
-            cfg.write(fh)
-    except Exception as exc:
-        log.warning("config.ini konnte nicht geschrieben werden: %s", exc)
-
-
-CFG = load_config()
-
-
-def cfg_get(section, key):
-    with _cfg_lock:
-        return CFG.get(section, key, fallback=DEFAULTS[section][key])
-
-
-def cfg_set(section, key, value):
-    with _cfg_lock:
-        CFG.set(section, key, str(value))
-
-
-def settings_dict():
-    with _cfg_lock:
-        return {s: dict(CFG.items(s)) for s in DEFAULTS}
+log.setLevel(logging.INFO)
 
 
 # --------------------------------------------------------------------------
-# Frame-Format (binär, little endian) für /api/frame
-#   0  4s   Magic "RS3D"
-#   4  I    Sequenznummer
-#   8  H    Breite
-#  10  H    Höhe
-#  12  f    fx
-#  16  f    fy
-#  20  f    ppx
-#  24  f    ppy
-#  28  f    Tiefeneinheit (Meter pro Rohwert)
-#  32  I    Flags (Bit0 = Farbbild vorhanden, Bit1 = Demo)
-#  36  f    Kamera-FPS (gemessen)
-#  40  ...  Tiefe uint16[w*h], danach optional RGB uint8[w*h*3]
+# Selbsttest (für den GitHub-Actions-Build)
 # --------------------------------------------------------------------------
-HEADER_FMT = "<4sIHHfffffIf"
-HEADER_SIZE = struct.calcsize(HEADER_FMT)  # 40
-
-
-def pack_frame(seq, depth, rgb, fx, fy, ppx, ppy, depth_units, demo, fps):
-    h, w = depth.shape
-    flags = (1 if rgb is not None else 0) | (2 if demo else 0)
-    head = struct.pack(HEADER_FMT, b"RS3D", seq & 0xFFFFFFFF, w, h,
-                       fx, fy, ppx, ppy, depth_units, flags, fps)
-    parts = [head, np.ascontiguousarray(depth, dtype="<u2").tobytes()]
-    if rgb is not None:
-        parts.append(np.ascontiguousarray(rgb, dtype=np.uint8).tobytes())
-    return b"".join(parts)
-
-
-# --------------------------------------------------------------------------
-# Kamera-Thread
-# --------------------------------------------------------------------------
-class CameraWorker(threading.Thread):
-    def __init__(self):
-        super().__init__(daemon=True, name="Kamera")
-        self.lock = threading.Lock()
-        self.cond = threading.Condition(self.lock)
-        self.frame = None
-        self.seq = 0
-        self.restart_flag = threading.Event()
-        self.stop_flag = threading.Event()
-        self.option_queue = []
-        self.status = {
-            "verbunden": False,
-            "demo": False,
-            "meldung": "Starte …",
-            "geraet": {},
-            "fps": 0.0,
-            "aufloesung": "",
-            "temperatur": None,
-            "optionen": {},
-            "sdk": (getattr(rs, "__version__", "?") if rs else None),
-            "sdk_fehler": RS_IMPORT_ERROR,
-        }
-        self._fps_t = time.time()
-        self._fps_n = 0
-        self._fps = 0.0
-
-    # ---------------- öffentliche Hilfen ----------------
-    def request_restart(self):
-        self.restart_flag.set()
-
-    def queue_option(self, name, value):
-        with self.lock:
-            self.option_queue.append((name, value))
-
-    def get_frame(self, after_seq, timeout=1.0):
-        with self.cond:
-            if self.seq <= after_seq:
-                self.cond.wait(timeout)
-            return self.seq, self.frame
-
-    def get_status(self):
-        with self.lock:
-            return json.loads(json.dumps(self.status))
-
-    def _set_status(self, **kw):
-        with self.lock:
-            self.status.update(kw)
-
-    def _publish(self, data):
-        with self.cond:
-            self.seq += 1
-            self.frame = data
-            self.cond.notify_all()
-
-    def _tick_fps(self):
-        self._fps_n += 1
-        now = time.time()
-        if now - self._fps_t >= 1.0:
-            self._fps = self._fps_n / (now - self._fps_t)
-            self._fps_n = 0
-            self._fps_t = now
-            self._set_status(fps=round(self._fps, 1))
-
-    # ---------------- Hauptschleife ----------------
-    def run(self):
-        while not self.stop_flag.is_set():
-            self.restart_flag.clear()
-            mode = cfg_get("kamera", "demo_modus").strip().lower()
-            if mode in ("ja", "1", "true", "an"):
-                self._run_demo(forever=True)
-                continue
-            if rs is None:
-                self._set_status(meldung="RealSense-SDK (pyrealsense2) nicht verfügbar – Demo-Modus")
-                self._run_demo(forever=True)
-                continue
-            try:
-                devs = rs.context().query_devices()
-                n = len(devs)
-            except Exception as exc:
-                n = 0
-                log.warning("Geräteabfrage fehlgeschlagen: %s", exc)
-            if n == 0:
-                msg = "Keine RealSense-Kamera gefunden – USB-Kabel prüfen (USB 3 empfohlen)"
-                self._set_status(verbunden=False, meldung=msg, geraet={})
-                if mode == "auto":
-                    # Demo zeigen, aber regelmäßig nach Kamera suchen
-                    self._run_demo(forever=False, dauer=3.0)
-                else:
-                    self._idle(2.0)
-                continue
-            try:
-                self._run_camera()
-            except Exception as exc:
-                log.error("Kamerafehler: %s", exc)
-                self._set_status(verbunden=False, meldung=f"Kamerafehler: {exc}")
-                self._idle(2.0)
-
-    def _idle(self, sec):
-        end = time.time() + sec
-        while time.time() < end and not self.restart_flag.is_set() and not self.stop_flag.is_set():
-            time.sleep(0.1)
-
-    # ---------------- echte Kamera ----------------
-    def _run_camera(self):
-        res = cfg_get("kamera", "aufloesung")
-        try:
-            w, h = [int(x) for x in res.lower().split("x")]
-        except Exception:
-            w, h = 848, 480
-        fps = int(float(cfg_get("kamera", "fps") or 30))
-        serial = cfg_get("kamera", "seriennummer").strip()
-
-        pipeline = rs.pipeline()
-        config = rs.config()
-        if serial:
-            config.enable_device(serial)
-        config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
-        config.enable_stream(rs.stream.color, w, h, rs.format.rgb8, fps)
-
-        self._set_status(meldung=f"Verbinde mit Kamera ({w}x{h} @ {fps} fps) …")
-        try:
-            profile = pipeline.start(config)
-            has_color = True
-        except Exception as exc:
-            log.warning("Start mit Farbe fehlgeschlagen (%s) – versuche nur Tiefe", exc)
-            config = rs.config()
-            if serial:
-                config.enable_device(serial)
-            config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
-            try:
-                profile = pipeline.start(config)
-            except Exception:
-                # letzte Rückfallebene: Standardprofil des Geräts
-                config = rs.config()
-                if serial:
-                    config.enable_device(serial)
-                config.enable_stream(rs.stream.depth, rs.format.z16)
-                profile = pipeline.start(config)
-            has_color = False
-
-        dev = profile.get_device()
-        depth_sensor = dev.first_depth_sensor()
-        depth_units = depth_sensor.get_depth_scale()
-
-        def info(key):
-            try:
-                return dev.get_info(key) if dev.supports(key) else ""
-            except Exception:
-                return ""
-
-        geraet = {
-            "name": info(rs.camera_info.name),
-            "seriennummer": info(rs.camera_info.serial_number),
-            "firmware": info(rs.camera_info.firmware_version),
-            "usb": info(rs.camera_info.usb_type_descriptor),
-            "produkt_linie": info(rs.camera_info.product_line),
-        }
-        log.info("Kamera verbunden: %s  SN %s  FW %s  USB %s", geraet["name"],
-                 geraet["seriennummer"], geraet["firmware"], geraet["usb"])
-
-        # Sensor-Optionen aus der Konfiguration anwenden
-        self._apply_initial_options(depth_sensor)
-
-        dprof = profile.get_stream(rs.stream.depth).as_video_stream_profile()
-        intr = dprof.get_intrinsics()
-        aw, ah = intr.width, intr.height
-
-        align = rs.align(rs.stream.depth) if has_color else None
-        spatial = rs.spatial_filter()
-        temporal = rs.temporal_filter()
-        holes = rs.hole_filling_filter()
-
-        usb_hint = ""
-        if geraet["usb"].startswith("2"):
-            usb_hint = " – Achtung: nur USB 2 erkannt, Auflösung/FPS eingeschränkt"
-        self._set_status(
-            verbunden=True, demo=False, geraet=geraet,
-            aufloesung=f"{aw}x{ah} @ {fps} fps" + ("" if has_color else " (ohne Farbe)"),
-            meldung="Kamera läuft" + usb_hint,
-            optionen=self._read_options(depth_sensor),
-        )
-
-        last_temp = 0.0
-        try:
-            while not self.restart_flag.is_set() and not self.stop_flag.is_set():
-                self._process_option_queue(depth_sensor)
-                try:
-                    frames = pipeline.wait_for_frames(3000)
-                except Exception as exc:
-                    raise RuntimeError(f"Keine Bilder mehr von der Kamera ({exc})")
-
-                if align is not None:
-                    frames = align.process(frames)
-                depth = frames.get_depth_frame()
-                if not depth:
-                    continue
-                color = frames.get_color_frame() if has_color else None
-
-                if _truthy(cfg_get("verarbeitung", "spatial_filter")):
-                    depth = spatial.process(depth)
-                if _truthy(cfg_get("verarbeitung", "temporal_filter")):
-                    depth = temporal.process(depth)
-                if _truthy(cfg_get("verarbeitung", "loecher_fuellen")):
-                    depth = holes.process(depth)
-
-                d = np.asanyarray(depth.get_data())
-                rgb = np.asanyarray(color.get_data()) if color else None
-
-                step = max(1, int(float(cfg_get("verarbeitung", "punktabstand") or 1)))
-                if step > 1:
-                    d = d[::step, ::step]
-                    if rgb is not None:
-                        rgb = rgb[::step, ::step]
-                fx, fy = intr.fx / step, intr.fy / step
-                ppx, ppy = (intr.ppx + 0.5) / step - 0.5, (intr.ppy + 0.5) / step - 0.5
-
-                self._tick_fps()
-                self._publish(pack_frame(self.seq + 1, d, rgb, fx, fy, ppx, ppy,
-                                         depth_units, False, self._fps))
-
-                now = time.time()
-                if now - last_temp > 2.0:
-                    last_temp = now
-                    self._set_status(temperatur=self._read_temp(depth_sensor))
-        finally:
-            try:
-                pipeline.stop()
-            except Exception:
-                pass
-            self._set_status(verbunden=False)
-
-    def _apply_initial_options(self, sensor):
-        try:
-            preset = cfg_get("kamera", "preset").strip()
-            if preset and sensor.supports(rs.option.visual_preset):
-                self._set_preset(sensor, preset)
-        except Exception as exc:
-            log.warning("Preset konnte nicht gesetzt werden: %s", exc)
-        try:
-            if sensor.supports(rs.option.emitter_enabled):
-                sensor.set_option(rs.option.emitter_enabled,
-                                  1.0 if _truthy(cfg_get("kamera", "laser")) else 0.0)
-        except Exception as exc:
-            log.warning("Laser an/aus fehlgeschlagen: %s", exc)
-        try:
-            if sensor.supports(rs.option.laser_power):
-                r = sensor.get_option_range(rs.option.laser_power)
-                val = float(cfg_get("kamera", "laserleistung") or r.default)
-                val = min(max(val, r.min), r.max)
-                sensor.set_option(rs.option.laser_power, val)
-        except Exception as exc:
-            log.warning("Laserleistung fehlgeschlagen: %s", exc)
-
-    def _set_preset(self, sensor, name):
-        r = sensor.get_option_range(rs.option.visual_preset)
-        for i in range(int(r.min), int(r.max) + 1):
-            try:
-                if sensor.get_option_value_description(rs.option.visual_preset, i) == name:
-                    sensor.set_option(rs.option.visual_preset, i)
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def _read_options(self, sensor):
-        out = {}
-        try:
-            if sensor.supports(rs.option.emitter_enabled):
-                out["laser"] = sensor.get_option(rs.option.emitter_enabled) > 0.5
-            if sensor.supports(rs.option.laser_power):
-                r = sensor.get_option_range(rs.option.laser_power)
-                out["laserleistung"] = sensor.get_option(rs.option.laser_power)
-                out["laserleistung_min"] = r.min
-                out["laserleistung_max"] = r.max
-                out["laserleistung_step"] = r.step
-            if sensor.supports(rs.option.visual_preset):
-                r = sensor.get_option_range(rs.option.visual_preset)
-                names = []
-                for i in range(int(r.min), int(r.max) + 1):
-                    try:
-                        names.append(sensor.get_option_value_description(rs.option.visual_preset, i))
-                    except Exception:
-                        pass
-                out["presets"] = [n for n in names if n]
-                cur = int(sensor.get_option(rs.option.visual_preset))
-                out["preset"] = sensor.get_option_value_description(rs.option.visual_preset, cur)
-        except Exception as exc:
-            log.debug("Optionen lesen: %s", exc)
-        return out
-
-    def _read_temp(self, sensor):
-        for opt in ("asic_temperature", "projector_temperature"):
-            try:
-                o = getattr(rs.option, opt)
-                if sensor.supports(o):
-                    return round(sensor.get_option(o), 1)
-            except Exception:
-                continue
-        return None
-
-    def _process_option_queue(self, sensor):
-        with self.lock:
-            queue, self.option_queue = self.option_queue, []
-        if not queue:
-            return
-        for name, value in queue:
-            try:
-                if name == "laser" and sensor.supports(rs.option.emitter_enabled):
-                    sensor.set_option(rs.option.emitter_enabled, 1.0 if value else 0.0)
-                elif name == "laserleistung" and sensor.supports(rs.option.laser_power):
-                    sensor.set_option(rs.option.laser_power, float(value))
-                elif name == "preset" and sensor.supports(rs.option.visual_preset):
-                    self._set_preset(sensor, str(value))
-            except Exception as exc:
-                log.warning("Option %s=%s fehlgeschlagen: %s", name, value, exc)
-        self._set_status(optionen=self._read_options(sensor))
-
-    # ---------------- Demo-Szene ----------------
-    def _run_demo(self, forever=True, dauer=3.0):
-        """Synthetische Szene, damit die Oberfläche ohne Kamera testbar ist."""
-        w, h = 640, 360
-        fx = fy = 450.0
-        ppx, ppy = (w - 1) / 2.0, (h - 1) / 2.0
-        units = 0.001
-        u, v = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-        rx = (u - ppx) / fx
-        ry = (v - ppy) / fy
-        self._set_status(demo=True, verbunden=False,
-                         geraet={"name": "Demo-Szene", "seriennummer": "—", "firmware": "—",
-                                 "usb": "—", "produkt_linie": "Demo"},
-                         aufloesung=f"{w}x{h} @ 15 fps (Demo-Szene)",
-                         optionen={})
-        if forever:
-            self._set_status(meldung="Demo-Modus aktiv")
-        start = time.time()
-        while not self.restart_flag.is_set() and not self.stop_flag.is_set():
-            t = time.time()
-            if not forever and t - start > dauer:
-                break
-            ph = t * 0.6
-            # Rückwand
-            z = np.full((h, w), 2.6, dtype=np.float32)
-            # Boden: y = +0.55 m (Kamera-y zeigt nach unten)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                zf = np.where(ry > 1e-3, 0.55 / ry, np.inf)
-            z = np.minimum(z, zf)
-            # Kugel
-            cx, cy, cz, r = 0.35 * math.sin(ph), 0.05, 1.5 + 0.25 * math.cos(ph), 0.32
-            dn = np.sqrt(rx * rx + ry * ry + 1.0)
-            dx, dy, dz = rx / dn, ry / dn, 1.0 / dn
-            b = dx * cx + dy * cy + dz * cz
-            c = cx * cx + cy * cy + cz * cz - r * r
-            disc = b * b - c
-            hit = disc > 0
-            tt = np.where(hit, b - np.sqrt(np.maximum(disc, 0)), np.inf)
-            zs = tt * dz
-            z = np.minimum(z, np.where(hit, zs, np.inf))
-            # Quader links
-            bx0, bx1, by0, bz0 = -0.85, -0.45, 0.10, 1.9
-            zb = np.full_like(z, bz0)
-            xb, yb = rx * zb, ry * zb
-            inside = (xb > bx0) & (xb < bx1) & (yb > by0) & (yb < 0.55)
-            z = np.where(inside & (zb < z), zb, z)
-            # Rauschen + Löcher wie bei echter Kamera
-            noise = np.random.normal(0, 0.002, z.shape).astype(np.float32) * z * z
-            z = z + noise
-            z[np.random.random(z.shape) < 0.01] = 0
-            depth = np.clip(z / units, 0, 65535).astype(np.uint16)
-            depth[~np.isfinite(z)] = 0
-
-            # Farbe: Muster je nach Fläche
-            X, Y = rx * z, ry * z
-            rgb = np.zeros((h, w, 3), dtype=np.uint8)
-            checker = ((np.floor(X * 4) + np.floor(z * 4)) % 2).astype(np.float32)
-            rgb[..., 0] = (40 + 30 * checker).astype(np.uint8)
-            rgb[..., 1] = (44 + 30 * checker).astype(np.uint8)
-            rgb[..., 2] = (52 + 30 * checker).astype(np.uint8)
-            wall = np.abs(z - 2.6) < 0.05
-            rgb[wall] = np.stack([
-                (60 + 40 * (np.sin(X * 6) * 0.5 + 0.5)),
-                (70 + 30 * (np.cos(Y * 6) * 0.5 + 0.5)),
-                (90 + 20 * np.ones_like(X)),
-            ], -1)[wall].astype(np.uint8)
-            sph = np.abs(z - zs) < 0.01
-            shade = np.clip(1.2 - (z - (cz - r)) / r, 0.3, 1.0)
-            rgb[sph] = (np.stack([255 * shade, 176 * shade, 0 * shade], -1))[sph].astype(np.uint8)
-            box = inside & (np.abs(z - bz0) < 0.02)
-            rgb[box] = (0, 200, 190)
-
-            step = max(1, int(float(cfg_get("verarbeitung", "punktabstand") or 1)))
-            if step > 1:
-                depth, rgb = depth[::step, ::step], rgb[::step, ::step]
-            sfx, sfy = fx / step, fy / step
-            sppx, sppy = (ppx + 0.5) / step - 0.5, (ppy + 0.5) / step - 0.5
-            self._tick_fps()
-            self._publish(pack_frame(self.seq + 1, depth, rgb, sfx, sfy, sppx, sppy,
-                                     units, True, self._fps))
-            sleep = 1 / 15 - (time.time() - t)
-            if sleep > 0:
-                time.sleep(sleep)
-        self._set_status(demo=False)
-
-
-CAM = CameraWorker()
-
-# --------------------------------------------------------------------------
-# Webserver
-# --------------------------------------------------------------------------
-app = Flask(__name__, static_folder=None)
-
-
-@app.after_request
-def _no_cache(resp):
-    if request.path.startswith("/api/"):
-        resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
-@app.route("/")
-def index():
-    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    html = html.replace("{{VERSION}}", APP_VERSION).replace("{{APP_NAME}}", APP_NAME)
-    return Response(html, mimetype="text/html")
-
-
-@app.route("/static/<path:name>")
-def static_files(name):
-    resp = send_from_directory(STATIC_DIR, name)
-    if name.endswith(".js"):
-        resp.headers["Content-Type"] = "text/javascript; charset=utf-8"
-    return resp
-
-
-@app.route("/api/frame")
-def api_frame():
-    try:
-        after = int(request.args.get("nach", "0"))
-    except ValueError:
-        after = 0
-    seq, data = CAM.get_frame(after, timeout=1.5)
-    if data is None or seq <= after:
-        return Response(status=204)
-    return Response(data, mimetype="application/octet-stream")
-
-
-@app.route("/api/status")
-def api_status():
-    st = CAM.get_status()
-    st["version"] = APP_VERSION
-    st["app"] = APP_NAME
-    st["einstellungen"] = settings_dict()
-    st["aufloesungen"] = AUFLOESUNGEN
-    st["fps_werte"] = FPS_WERTE
-    st["port_aktiv"] = ACTIVE_PORT
-    st["config_pfad"] = str(CONFIG_PATH)
-    return jsonify(st)
-
-
-RESTART_KEYS = {("kamera", "aufloesung"), ("kamera", "fps"), ("kamera", "seriennummer"),
-                ("kamera", "demo_modus")}
-LIVE_OPTION_KEYS = {"laser", "laserleistung", "preset"}
-
-
-@app.route("/api/einstellungen", methods=["POST"])
-def api_settings():
-    data = request.get_json(silent=True) or {}
-    restart = False
-    port_changed = False
-    for section, values in data.items():
-        if section not in DEFAULTS or not isinstance(values, dict):
-            continue
-        for key, value in values.items():
-            if key not in DEFAULTS[section]:
-                continue
-            if isinstance(value, bool):
-                value = "ja" if value else "nein"
-            value = str(value)
-            if section == "server" and key == "port":
-                try:
-                    p = int(value)
-                    if not 1 <= p <= 65535:
-                        raise ValueError
-                except ValueError:
-                    return jsonify(ok=False, fehler="Ungültiger Port"), 400
-                port_changed = p != ACTIVE_PORT
-            old = cfg_get(section, key)
-            cfg_set(section, key, value)
-            if (section, key) in RESTART_KEYS and old != value:
-                restart = True
-            if section == "kamera" and key in LIVE_OPTION_KEYS:
-                CAM.queue_option(key, _truthy(value) if key == "laser" else value)
-    with _cfg_lock:
-        save_config(CFG)
-    if restart:
-        CAM.request_restart()
-    return jsonify(ok=True, neustart_kamera=restart, port_neustart=port_changed)
-
-
-@app.route("/api/kamera/neustart", methods=["POST"])
-def api_cam_restart():
-    CAM.request_restart()
-    return jsonify(ok=True)
-
-
-@app.route("/api/geraete")
-def api_devices():
-    out = []
-    if rs is not None:
-        try:
-            for d in rs.context().query_devices():
-                out.append({
-                    "name": d.get_info(rs.camera_info.name),
-                    "seriennummer": d.get_info(rs.camera_info.serial_number),
-                })
-        except Exception as exc:
-            log.debug("Geräteliste: %s", exc)
-    return jsonify(out)
-
-
-ACTIVE_PORT = int(cfg_get("server", "port") or 8095)
-
-
 def selbsttest():
-    """Wird im GitHub-Actions-Build aufgerufen: prüft, ob alles in der exe steckt."""
-    ok = True
-    print(f"{APP_NAME} v{APP_VERSION} – Selbsttest")
-    for name in ("index.html", "style.css", "app.js", "logo.svg",
-                 "vendor/three.module.min.js", "vendor/OrbitControls.js"):
-        exists = (STATIC_DIR / name).exists()
-        ok &= exists
-        print(f"  [{'OK' if exists else 'FEHLT'}] static/{name}")
-    if rs is None:
-        ok = False
-        print(f"  [FEHLT] pyrealsense2: {RS_IMPORT_ERROR}")
-    else:
+    lines, ok = [f"{APP_NAME} v{APP_VERSION} – Selbsttest"], True
+
+    def chk(name, fn):
+        nonlocal ok
         try:
-            n = len(rs.context().query_devices())
-            print(f"  [OK] pyrealsense2 {getattr(rs, '__version__', '?')} – {n} Gerät(e)")
+            info = fn()
+            lines.append(f"  [OK] {name} {info or ''}")
         except Exception as exc:
             ok = False
-            print(f"  [FEHLER] RealSense-Kontext: {exc}")
-    print("Ergebnis:", "OK" if ok else "FEHLER")
+            lines.append(f"  [FEHLER] {name}: {exc}")
+
+    chk("Symbole", lambda: ((ASSET_DIR / "icon.png").stat().st_size, (ASSET_DIR / "pfeil.png").stat().st_size) and "")
+    chk("PySide6", lambda: __import__("PySide6").__version__)
+    chk("pyqtgraph", lambda: __import__("pyqtgraph").__version__)
+    chk("pyqtgraph.opengl", lambda: __import__("pyqtgraph.opengl") and "")
+    chk("PyOpenGL", lambda: __import__("OpenGL").__version__)
+
+    def rs_check():
+        if kamera.rs is None:
+            raise RuntimeError(kamera.RS_IMPORT_ERROR)
+        n = len(kamera.rs.context().query_devices())
+        return f"{getattr(kamera.rs, '__version__', '?')} – {n} Gerät(e)"
+    chk("pyrealsense2", rs_check)
+    lines.append("Ergebnis: " + ("OK" if ok else "FEHLER"))
+    text = "\n".join(lines)
+    try:
+        (BASE_DIR / "selbsttest.txt").write_text(text + "\n", encoding="utf-8")
+    except Exception:
+        pass
+    if sys.stdout is not None:
+        try:
+            print(text)
+        except Exception:
+            pass
     return 0 if ok else 1
 
 
-def main():
-    global ACTIVE_PORT
-    if "--selbsttest" in sys.argv:
-        sys.exit(selbsttest())
-    host = cfg_get("server", "host") or "0.0.0.0"
-    ACTIVE_PORT = int(cfg_get("server", "port") or 8095)
-    print("=" * 62)
-    print(f"  {APP_NAME}  v{APP_VERSION}")
-    print(f"  Webseite:   http://localhost:{ACTIVE_PORT}")
-    print(f"  Konfig:     {CONFIG_PATH}")
-    if rs is None:
-        print(f"  WARNUNG: pyrealsense2 nicht geladen ({RS_IMPORT_ERROR})")
-    print("  Beenden:    Strg+C oder Fenster schließen")
-    print("=" * 62)
-    CAM.start()
-    if _truthy(cfg_get("server", "browser_oeffnen")) and "--kein-browser" not in sys.argv:
-        threading.Timer(1.2, lambda: webbrowser.open(f"http://localhost:{ACTIVE_PORT}")).start()
+if __name__ == "__main__" and "--selbsttest" in sys.argv:
+    sys.exit(selbsttest())
+
+# --------------------------------------------------------------------------
+# Qt
+# --------------------------------------------------------------------------
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal  # noqa: E402
+from PySide6.QtGui import (QAction, QColor, QFont, QIcon, QImage, QKeySequence,  # noqa: E402
+                           QLinearGradient, QPainter, QPen, QPixmap)
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,  # noqa: E402
+                               QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+                               QLineEdit, QMainWindow, QMessageBox, QPushButton,
+                               QScrollArea, QSizePolicy, QSlider, QStackedWidget,
+                               QVBoxLayout, QWidget)
+
+import pyqtgraph as pg  # noqa: E402
+import pyqtgraph.opengl as gl  # noqa: E402
+
+# Farben wie in den Dashboards
+BG, BG2, PANEL, PANEL2 = "#0b0e11", "#0f1317", "#12161b", "#171c22"
+LINE, LINE2 = "#232a32", "#2e3740"
+TEXT, MUTED = "#d7dde3", "#7d8893"
+AMBER, TEAL, RED = "#ffb000", "#19d3c5", "#ff5a5f"
+MONO = "Cascadia Mono, Consolas, JetBrains Mono, DejaVu Sans Mono, monospace"
+
+ARROW = (ASSET_DIR / "pfeil.png").as_posix()
+
+QSS = f"""
+* {{ font-family: "Segoe UI", "Inter", "Noto Sans", sans-serif; font-size: 10pt; color: {TEXT}; }}
+QMainWindow, #root {{ background: {BG}; }}
+#topbar {{ background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #11161b, stop:1 #0d1115); border-bottom: 1px solid {LINE}; }}
+#brandTitle {{ color: {AMBER}; font-weight: 700; font-size: 11.5pt; letter-spacing: 2px; }}
+#brandSub {{ color: {MUTED}; font-size: 7.5pt; letter-spacing: 2px; }}
+#tabs {{ background: {BG}; border: 1px solid {LINE}; border-radius: 8px; }}
+#tabs QPushButton {{ background: transparent; border: 0; border-radius: 6px; padding: 6px 16px; color: {MUTED};
+    font-size: 8.5pt; font-weight: 600; letter-spacing: 2px; }}
+#tabs QPushButton:hover {{ color: {TEXT}; }}
+#tabs QPushButton:checked {{ background: rgba(255,176,0,36); color: {AMBER}; border: 1px solid rgba(255,176,0,90); }}
+#pill {{ background: {PANEL}; border: 1px solid {LINE2}; border-radius: 13px; padding: 4px 12px;
+    font-size: 8.5pt; font-weight: 600; letter-spacing: 1px; }}
+#pill[state="ok"] {{ color: {TEAL}; border-color: rgba(25,211,197,110); }}
+#pill[state="demo"] {{ color: {AMBER}; border-color: rgba(255,176,0,110); }}
+#pill[state="err"] {{ color: {RED}; border-color: rgba(255,90,95,110); }}
+#clock {{ color: {MUTED}; font-family: {MONO}; font-size: 9pt; }}
+
+#sidebar, #sidebarInner {{ background: {BG2}; border: 0; }}
+#sidebar {{ border-right: 1px solid {LINE}; }}
+#panel {{ background: {PANEL}; border: 1px solid {LINE}; border-radius: 10px; }}
+#panelTitle {{ color: {MUTED}; font-size: 8pt; font-weight: 700; letter-spacing: 3px; }}
+#tick {{ background: {AMBER}; }}
+#kvKey {{ color: {MUTED}; font-size: 9pt; }}
+#kvVal {{ font-size: 9pt; }}
+#kvValMono {{ font-family: {MONO}; font-size: 9pt; }}
+#fieldLabel {{ color: {MUTED}; font-size: 9pt; }}
+#fieldValue {{ color: {AMBER}; font-family: {MONO}; font-size: 9pt; }}
+#hint {{ color: {MUTED}; font-size: 8.5pt; }}
+
+QComboBox, QLineEdit {{ background: {PANEL2}; border: 1px solid {LINE2}; border-radius: 7px; padding: 6px 9px; }}
+QComboBox:focus, QLineEdit:focus {{ border-color: {AMBER}; }}
+QComboBox::drop-down {{ border: 0; width: 22px; }}
+QComboBox::down-arrow {{ image: url("{ARROW}"); width: 10px; height: 6px; margin-right: 8px; }}
+QComboBox QAbstractItemView {{ background: {PANEL2}; border: 1px solid {LINE2}; selection-background-color: rgba(255,176,0,50);
+    selection-color: {AMBER}; outline: 0; }}
+QComboBox:disabled, QSlider:disabled {{ color: #4a535c; }}
+
+QSlider::groove:horizontal {{ height: 4px; background: {LINE2}; border-radius: 2px; }}
+QSlider::sub-page:horizontal {{ background: rgba(255,176,0,120); border-radius: 2px; }}
+QSlider::handle:horizontal {{ background: {AMBER}; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; border: 2px solid {BG}; }}
+QSlider::handle:horizontal:disabled {{ background: #4a535c; }}
+
+#seg {{ background: {BG}; border: 1px solid {LINE2}; border-radius: 7px; }}
+#seg QPushButton {{ background: transparent; border: 0; border-radius: 5px; padding: 6px 0; color: {MUTED};
+    font-size: 8pt; font-weight: 600; letter-spacing: 1px; }}
+#seg QPushButton:hover {{ color: {TEXT}; }}
+#seg QPushButton:checked {{ background: rgba(25,211,197,33); color: {TEAL}; border: 1px solid rgba(25,211,197,90); }}
+
+QPushButton#btn {{ background: {PANEL2}; border: 1px solid {LINE2}; border-radius: 7px; padding: 8px 10px;
+    font-size: 8.5pt; font-weight: 600; letter-spacing: 1px; }}
+QPushButton#btn:hover {{ border-color: {TEAL}; color: {TEAL}; }}
+QPushButton#btn:checked {{ border-color: {AMBER}; color: {AMBER}; background: rgba(255,176,0,36); }}
+QPushButton#btnAccent {{ background: rgba(255,176,0,36); border: 1px solid rgba(255,176,0,130); border-radius: 7px;
+    padding: 8px 10px; color: {AMBER}; font-size: 8.5pt; font-weight: 600; letter-spacing: 1px; }}
+QPushButton#btnAccent:hover {{ background: rgba(255,176,0,56); }}
+
+#stage {{ background: {BG}; }}
+#pane {{ background: #07090b; border: 1px solid {LINE}; border-radius: 10px; }}
+#paneLabel {{ color: {MUTED}; font-size: 8pt; font-weight: 700; letter-spacing: 3px; }}
+#hud {{ color: {TEAL}; font-family: {MONO}; font-size: 8.5pt; }}
+#hudDim {{ color: #4c5660; font-size: 7.5pt; letter-spacing: 1px; }}
+#badge {{ color: {AMBER}; background: rgba(255,176,0,36); border: 1px solid rgba(255,176,0,115); border-radius: 6px;
+    padding: 3px 9px; font-size: 8pt; font-weight: 700; letter-spacing: 2px; }}
+#badgeTeal {{ color: {TEAL}; background: rgba(25,211,197,33); border: 1px solid rgba(25,211,197,115); border-radius: 6px;
+    padding: 3px 9px; font-size: 8pt; font-weight: 700; letter-spacing: 2px; }}
+#noSignalTitle {{ color: {RED}; font-size: 15pt; font-weight: 700; letter-spacing: 6px; }}
+#noSignalText {{ color: {MUTED}; }}
+
+#statusbar {{ background: #0d1115; border-top: 1px solid {LINE}; }}
+#statusMsg {{ font-family: {MONO}; font-size: 8.5pt; }}
+#statusDim {{ color: {MUTED}; font-family: {MONO}; font-size: 8.5pt; }}
+
+QScrollBar:vertical {{ background: transparent; width: 8px; margin: 0; }}
+QScrollBar::handle:vertical {{ background: {LINE2}; border-radius: 4px; min-height: 30px; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+QToolTip {{ background: {PANEL2}; color: {TEXT}; border: 1px solid {LINE2}; padding: 4px; }}
+QMessageBox {{ background: {PANEL}; }}
+"""
+
+# --------------------------------------------------------------------------
+# Turbo-Farbskala
+# --------------------------------------------------------------------------
+def _turbo_lut():
+    x = np.linspace(0, 1, 256)
+    r = 0.13572138 + x * (4.61539260 + x * (-42.66032258 + x * (132.13108234 + x * (-152.94239396 + x * 59.28637943))))
+    g = 0.09140261 + x * (2.19418839 + x * (4.84296658 + x * (-14.18503333 + x * (4.27729857 + x * 2.82956604))))
+    b = 0.10667330 + x * (12.64194608 + x * (-60.58204836 + x * (110.36276771 + x * (-89.90310912 + x * 27.34824973))))
+    return np.clip(np.stack([r, g, b], -1), 0, 1).astype(np.float32)
+
+
+TURBO_F = _turbo_lut()                              # 256x3 float
+TURBO_U8 = (TURBO_F * 255).astype(np.uint8)         # 256x3 uint8
+AMBER_F = np.array([1.0, 176 / 255, 0.0], np.float32)
+TEAL_F = np.array([25 / 255, 211 / 255, 197 / 255], np.float32)
+
+
+# --------------------------------------------------------------------------
+# Eigene Bedienelemente
+# --------------------------------------------------------------------------
+class Toggle(QCheckBox):
+    """Schiebeschalter im Dashboard-Stil."""
+
+    def __init__(self, text):
+        super().__init__(text)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(24)
+
+    def sizeHint(self):
+        fm = self.fontMetrics()
+        return QSize(44 + fm.horizontalAdvance(self.text()), 24)
+
+    def hitButton(self, pos):
+        return self.rect().contains(pos)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        on = self.isChecked()
+        alpha = 1.0 if self.isEnabled() else 0.35
+        p.setOpacity(alpha)
+        y = (self.height() - 18) / 2
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(25, 211, 197, 90) if on else QColor(LINE2))
+        p.drawRoundedRect(QRectF(0, y, 34, 18), 9, 9)
+        p.setBrush(QColor(TEAL) if on else QColor("#9aa5b0"))
+        p.drawEllipse(QRectF(18 if on else 2, y + 2, 14, 14))
+        p.setPen(QColor(TEXT))
+        p.drawText(QRectF(44, 0, self.width() - 44, self.height()), Qt.AlignVCenter | Qt.AlignLeft, self.text())
+
+
+class Segmented(QFrame):
+    changed = Signal(str)
+
+    def __init__(self, items, name="seg"):
+        super().__init__()
+        self.setObjectName(name)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(2)
+        self.group = QButtonGroup(self)
+        self.group.setExclusive(True)
+        self.buttons = {}
+        for value, label in items:
+            b = QPushButton(label)
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(lambda _=False, v=value: self.changed.emit(v))
+            self.group.addButton(b)
+            lay.addWidget(b)
+            self.buttons[value] = b
+
+    def set_value(self, value):
+        b = self.buttons.get(str(value))
+        if b:
+            b.setChecked(True)
+        else:
+            self.group.setExclusive(False)
+            for x in self.buttons.values():
+                x.setChecked(False)
+            self.group.setExclusive(True)
+
+
+class Panel(QFrame):
+    def __init__(self, title):
+        super().__init__()
+        self.setObjectName("panel")
+        self.lay = QVBoxLayout(self)
+        self.lay.setContentsMargins(12, 11, 12, 12)
+        self.lay.setSpacing(9)
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        tick = QFrame()
+        tick.setObjectName("tick")
+        tick.setFixedSize(10, 2)
+        lbl = QLabel(title)
+        lbl.setObjectName("panelTitle")
+        head.addWidget(tick, 0, Qt.AlignVCenter)
+        head.addWidget(lbl)
+        head.addStretch()
+        self.lay.addLayout(head)
+
+    def add(self, w):
+        if isinstance(w, QWidget):
+            self.lay.addWidget(w)
+        else:
+            self.lay.addLayout(w)
+        return w
+
+
+def field_header(text):
+    row = QHBoxLayout()
+    l = QLabel(text)
+    l.setObjectName("fieldLabel")
+    v = QLabel("")
+    v.setObjectName("fieldValue")
+    row.addWidget(l)
+    row.addStretch()
+    row.addWidget(v)
+    return row, v
+
+
+def make_label(text, name):
+    l = QLabel(text)
+    l.setObjectName(name)
+    return l
+
+
+def make_button(text, name="btn", checkable=False):
+    b = QPushButton(text)
+    b.setObjectName(name)
+    b.setCheckable(checkable)
+    b.setCursor(Qt.PointingHandCursor)
+    return b
+
+
+class Pane(QFrame):
+    """Rahmen mit Titel, HUD-Ecken (Amber) und Fußzeile."""
+
+    def __init__(self, title, body):
+        super().__init__()
+        self.setObjectName("pane")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(8)
+        head = QHBoxLayout()
+        head.addWidget(make_label(title, "paneLabel"))
+        head.addStretch()
+        self.badges = QHBoxLayout()
+        self.badges.setSpacing(6)
+        head.addLayout(self.badges)
+        lay.addLayout(head)
+        lay.addWidget(body, 1)
+        foot = QHBoxLayout()
+        self.hud = make_label("—", "hud")
+        self.hud_right = make_label("", "hudDim")
+        foot.addWidget(self.hud)
+        foot.addStretch()
+        foot.addWidget(self.hud_right)
+        lay.addLayout(foot)
+
+    def add_badge(self, text, name="badge"):
+        b = make_label(text, name)
+        b.hide()
+        self.badges.addWidget(b)
+        return b
+
+    def paintEvent(self, ev):
+        super().paintEvent(ev)
+        p = QPainter(self)
+        p.setPen(QPen(QColor(255, 176, 0, 150), 2))
+        w, h, s, m = self.width(), self.height(), 14, 5
+        for (x, y, dx, dy) in ((m, m, 1, 1), (w - m, m, -1, 1), (m, h - m, 1, -1), (w - m, h - m, -1, -1)):
+            p.drawLine(QPointF(x, y), QPointF(x + dx * s, y))
+            p.drawLine(QPointF(x, y), QPointF(x, y + dy * s))
+
+
+class ImageView(QWidget):
+    """Zeigt ein QImage seitenrichtig skaliert an und meldet die Pixelposition unter der Maus."""
+    hovered = Signal(int, int)
+    left = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.img = None
+        self.setMouseTracking(True)
+        self.setMinimumSize(160, 100)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_image(self, img):
+        self.img = img
+        self.update()
+
+    def _target(self):
+        if self.img is None:
+            return None
+        iw, ih = self.img.width(), self.img.height()
+        s = min(self.width() / iw, self.height() / ih)
+        w, h = iw * s, ih * s
+        return QRectF((self.width() - w) / 2, (self.height() - h) / 2, w, h), s
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#07090b"))
+        t = self._target()
+        if t:
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.drawImage(t[0], self.img)
+
+    def mouseMoveEvent(self, e):
+        t = self._target()
+        if not t:
+            return
+        r, s = t
+        u = int((e.position().x() - r.x()) / s)
+        v = int((e.position().y() - r.y()) / s)
+        if 0 <= u < self.img.width() and 0 <= v < self.img.height():
+            self.hovered.emit(u, v)
+        else:
+            self.left.emit()
+
+    def leaveEvent(self, _):
+        self.left.emit()
+
+
+class ColorBar(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setFixedWidth(58)
+        self.near, self.far = 0.15, 3.0
+
+    def set_range(self, near, far):
+        self.near, self.far = near, far
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        h = self.height()
+        top, bot = 24, h - 24
+        bar = QRectF(24, top, 10, max(10, bot - top))
+        g = QLinearGradient(0, bar.top(), 0, bar.bottom())
+        for i in range(0, 256, 16):
+            c = TURBO_U8[255 - i]
+            g.setColorAt(i / 255, QColor(int(c[0]), int(c[1]), int(c[2])))
+        g.setColorAt(1.0, QColor(*[int(x) for x in TURBO_U8[0]]))
+        p.setPen(QPen(QColor(LINE2), 1))
+        p.setBrush(g)
+        p.drawRoundedRect(bar, 4, 4)
+        p.setPen(QColor(TEXT))
+        f = QFont()
+        f.setFamilies(["Cascadia Mono", "Consolas", "DejaVu Sans Mono"])
+        f.setPointSizeF(7.5)
+        p.setFont(f)
+        p.drawText(QRectF(0, 2, self.width(), 18), Qt.AlignCenter, f"{self.near:.2f} m")
+        p.drawText(QRectF(0, h - 20, self.width(), 18), Qt.AlignCenter, f"{self.far:.1f} m")
+
+
+# --------------------------------------------------------------------------
+# Hauptfenster
+# --------------------------------------------------------------------------
+CAM_PRESETS = {
+    # center (x, y, z), Abstand, Elevation, Azimut  –  Kamera sitzt im Ursprung und blickt in +Y
+    "kamera": ((0, 1.5, 0), 1.52, 0, -90),
+    "schraeg": ((0, 1.4, 0), 3.3, 22, -125),
+    "oben": ((0, 1.4, 0), 3.6, 89, -90),
+    "seite": ((0, 1.4, 0), 3.3, 4, 0),
+}
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, cam):
+        super().__init__()
+        self.cam = cam
+        self.last_seq = -1
+        self.last = None
+        self.frozen = False
+        self.view = "3d"
+        self.rays_key = None
+        self.rays = None
+        self.cloud_pos = np.zeros((0, 3), np.float32)
+        self.cloud_col = np.zeros((0, 4), np.float32)
+        self.mean_z = 0.0
+        self.hover_text = None
+        self._opt_sig = None
+        self._updating_ui = False
+
+        self.setWindowTitle(f"{APP_NAME}  v{APP_VERSION}")
+        icon_path = ASSET_DIR / "icon.png"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+
+        root = QWidget()
+        root.setObjectName("root")
+        self.setCentralWidget(root)
+        v = QVBoxLayout(root)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        v.addWidget(self._build_topbar())
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(self._build_sidebar())
+        body.addWidget(self._build_stage(), 1)
+        v.addLayout(body, 1)
+        v.addWidget(self._build_statusbar())
+
+        self._load_settings()
+        self._build_shortcuts()
+
+        self.save_timer = QTimer(self, singleShot=True, interval=400, timeout=cfg_save)
+        self.frame_timer = QTimer(self, interval=15, timeout=self._poll_frame)
+        self.status_timer = QTimer(self, interval=500, timeout=self._poll_status)
+        self.clock_timer = QTimer(self, interval=1000, timeout=self._tick_clock)
+        self.frame_timer.start()
+        self.status_timer.start()
+        self.clock_timer.start()
+        self._tick_clock()
+        self._poll_status()
+
+    # ------------------------------------------------------------------ Aufbau
+    def _build_topbar(self):
+        bar = QFrame()
+        bar.setObjectName("topbar")
+        bar.setFixedHeight(60)
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(16, 0, 16, 0)
+        h.setSpacing(14)
+
+        logo = QLabel()
+        pm = QPixmap(str(ASSET_DIR / "icon.png"))
+        if not pm.isNull():
+            logo.setPixmap(pm.scaled(36, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        h.addWidget(logo)
+        brand = QVBoxLayout()
+        brand.setSpacing(0)
+        title = QLabel(f"REALSENSE<span style='color:{MUTED}'>-VIEWER</span>")
+        title.setObjectName("brandTitle")
+        brand.addStretch()
+        brand.addWidget(title)
+        brand.addWidget(make_label(f"MK1 · D415 TIEFENKAMERA · v{APP_VERSION}", "brandSub"))
+        brand.addStretch()
+        h.addLayout(brand)
+        h.addStretch(1)
+
+        self.tabs = Segmented([("3d", "3D"), ("tiefe", "TIEFE"), ("farbe", "FARBE"), ("geteilt", "GETEILT")], "tabs")
+        self.tabs.changed.connect(lambda v: self.set_view(v, True))
+        self.tabs.setFixedHeight(38)
+        h.addWidget(self.tabs, 0, Qt.AlignVCenter)
+        h.addStretch(1)
+
+        self.pill_cam = make_label("● SUCHE", "pill")
+        self.pill_fps = make_label("— FPS", "pill")
+        self.pill_fps.setStyleSheet(f"font-family: {MONO};")
+        self.clock = make_label("--:--:--", "clock")
+        for pill in (self.pill_cam, self.pill_fps):
+            pill.setFixedHeight(28)
+            h.addWidget(pill, 0, Qt.AlignVCenter)
+        h.addWidget(self.clock)
+        return bar
+
+    def _build_sidebar(self):
+        scroll = QScrollArea()
+        scroll.setObjectName("sidebar")
+        scroll.setWidgetResizable(True)
+        scroll.setFixedWidth(310)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        inner = QWidget()
+        inner.setObjectName("sidebarInner")
+        lay = QVBoxLayout(inner)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(12)
+
+        # GERÄT
+        p = Panel("GERÄT")
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(5)
+        self.kv = {}
+        for i, (key, label, mono) in enumerate([
+                ("name", "Modell", False), ("seriennummer", "Seriennr.", True), ("firmware", "Firmware", True),
+                ("usb", "USB", True), ("stream", "Stream", True), ("temp", "Temperatur", True), ("sdk", "SDK", True)]):
+            grid.addWidget(make_label(label, "kvKey"), i, 0)
+            val = make_label("—", "kvValMono" if mono else "kvVal")
+            val.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            val.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            grid.addWidget(val, i, 1)
+            self.kv[key] = val
+        grid.setColumnStretch(1, 1)
+        p.add(grid)
+        lay.addWidget(p)
+
+        # KAMERA
+        p = Panel("KAMERA")
+        p.add(make_label("Auflösung", "fieldLabel"))
+        self.sel_res = p.add(QComboBox())
+        for r in AUFLOESUNGEN:
+            self.sel_res.addItem(r.replace("x", " × "), r)
+        p.add(make_label("Bildrate", "fieldLabel"))
+        self.sel_fps = p.add(QComboBox())
+        for f in FPS_WERTE:
+            self.sel_fps.addItem(f"{f} fps", str(f))
+        p.add(make_label("Betriebsart", "fieldLabel"))
+        self.sel_mode = p.add(QComboBox())
+        for val, txt in (("auto", "Automatisch (Demo ohne Kamera)"), ("nein", "Nur Kamera"), ("ja", "Demo-Szene")):
+            self.sel_mode.addItem(txt, val)
+        self.cam_opts = QWidget()
+        co = QVBoxLayout(self.cam_opts)
+        co.setContentsMargins(0, 4, 0, 0)
+        co.setSpacing(9)
+        self.chk_laser = Toggle("IR-Projektor (Laser)")
+        co.addWidget(self.chk_laser)
+        row, self.lbl_laser = field_header("Laserleistung")
+        co.addLayout(row)
+        self.rng_laser = QSlider(Qt.Horizontal)
+        self.rng_laser.setRange(0, 360)
+        self.rng_laser.setSingleStep(30)
+        co.addWidget(self.rng_laser)
+        co.addWidget(make_label("Preset", "fieldLabel"))
+        self.sel_preset = QComboBox()
+        co.addWidget(self.sel_preset)
+        p.add(self.cam_opts)
+        self.cam_hint = p.add(make_label("Optionen nur mit angeschlossener Kamera.", "hint"))
+        self.btn_restart = p.add(make_button("KAMERA NEU VERBINDEN"))
+        lay.addWidget(p)
+
+        # VERARBEITUNG
+        p = Panel("VERARBEITUNG")
+        p.add(make_label("Punktabstand (Pixel)", "fieldLabel"))
+        self.seg_step = p.add(Segmented([(str(i), str(i)) for i in (1, 2, 3, 4)]))
+        self.chk_spatial = p.add(Toggle("Glättung (räumlich)"))
+        self.chk_temporal = p.add(Toggle("Glättung (zeitlich)"))
+        self.chk_holes = p.add(Toggle("Löcher füllen"))
+        row, self.lbl_min = field_header("Min. Distanz")
+        p.add(row)
+        self.rng_min = p.add(QSlider(Qt.Horizontal))
+        self.rng_min.setRange(0, 300)          # cm
+        row, self.lbl_max = field_header("Max. Distanz")
+        p.add(row)
+        self.rng_max = p.add(QSlider(Qt.Horizontal))
+        self.rng_max.setRange(3, 100)          # dm
+        lay.addWidget(p)
+
+        # DARSTELLUNG
+        p = Panel("DARSTELLUNG")
+        p.add(make_label("Punktfarbe", "fieldLabel"))
+        self.seg_color = p.add(Segmented([("rgb", "RGB"), ("tiefe", "TIEFE"), ("amber", "AMBER"), ("teal", "TEAL")]))
+        row, self.lbl_size = field_header("Punktgröße")
+        p.add(row)
+        self.rng_size = p.add(QSlider(Qt.Horizontal))
+        self.rng_size.setRange(1, 16)          # halbe Pixel
+        self.chk_grid = p.add(Toggle("Bodenraster"))
+        self.chk_axes = p.add(Toggle("Kamera & Achsen"))
+        p.add(make_label("Blickwinkel", "fieldLabel"))
+        self.seg_cam = p.add(Segmented([("kamera", "KAMERA"), ("schraeg", "SCHRÄG"), ("oben", "OBEN"), ("seite", "SEITE")]))
+        lay.addWidget(p)
+
+        # AUFNAHME
+        p = Panel("AUFNAHME")
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.btn_freeze = make_button("EINFRIEREN", checkable=True)
+        self.btn_shot = make_button("BILD (PNG)")
+        row.addWidget(self.btn_freeze)
+        row.addWidget(self.btn_shot)
+        p.add(row)
+        self.btn_ply = p.add(make_button("PUNKTWOLKE SPEICHERN (PLY)", "btnAccent"))
+        p.add(make_label("Leertaste: Einfrieren · Strg+S: PLY · F11: Vollbild", "hint"))
+        lay.addWidget(p)
+
+        # SYSTEM
+        p = Panel("SYSTEM")
+        cfg_lbl = make_label(f"Konfiguration:\n{CONFIG_PATH}", "hint")
+        cfg_lbl.setWordWrap(True)
+        cfg_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        cfg_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        p.add(cfg_lbl)
+        self.btn_folder = p.add(make_button("PROGRAMMORDNER ÖFFNEN"))
+        lay.addWidget(p)
+        lay.addStretch()
+
+        for combo in (self.sel_res, self.sel_fps, self.sel_mode, self.sel_preset):
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(8)
+        scroll.setWidget(inner)
+
+        # Signale
+        self.sel_res.currentIndexChanged.connect(lambda: self._set("kamera", "aufloesung", self.sel_res.currentData(), restart=True))
+        self.sel_fps.currentIndexChanged.connect(lambda: self._set("kamera", "fps", self.sel_fps.currentData(), restart=True))
+        self.sel_mode.currentIndexChanged.connect(lambda: self._set("kamera", "demo_modus", self.sel_mode.currentData(), restart=True))
+        self.chk_laser.toggled.connect(lambda v: self._set("kamera", "laser", v, live=("laser", v)))
+        self.rng_laser.valueChanged.connect(lambda v: self.lbl_laser.setText(f"{v} mW"))
+        self.rng_laser.sliderReleased.connect(
+            lambda: self._set("kamera", "laserleistung", self.rng_laser.value(), live=("laserleistung", self.rng_laser.value())))
+        self.sel_preset.activated.connect(
+            lambda: self._set("kamera", "preset", self.sel_preset.currentText(), live=("preset", self.sel_preset.currentText())))
+        self.btn_restart.clicked.connect(lambda: (self.cam.request_restart(), self.flash("Kamera wird neu verbunden …")))
+        self.seg_step.changed.connect(lambda v: self._set("verarbeitung", "punktabstand", v))
+        self.chk_spatial.toggled.connect(lambda v: self._set("verarbeitung", "spatial_filter", v))
+        self.chk_temporal.toggled.connect(lambda v: self._set("verarbeitung", "temporal_filter", v))
+        self.chk_holes.toggled.connect(lambda v: self._set("verarbeitung", "loecher_fuellen", v))
+        self.rng_min.valueChanged.connect(self._on_range)
+        self.rng_max.valueChanged.connect(self._on_range)
+        self.seg_color.changed.connect(self._on_color)
+        self.rng_size.valueChanged.connect(self._on_size)
+        self.chk_grid.toggled.connect(self._on_helpers)
+        self.chk_axes.toggled.connect(self._on_helpers)
+        self.seg_cam.changed.connect(self._on_cam_preset)
+        self.btn_freeze.toggled.connect(self._on_freeze)
+        self.btn_shot.clicked.connect(self.save_png)
+        self.btn_ply.clicked.connect(self.save_ply)
+        self.btn_folder.clicked.connect(self._open_folder)
+        return scroll
+
+    def _build_stage(self):
+        stage = QWidget()
+        stage.setObjectName("stage")
+        self.stage_grid = QGridLayout(stage)
+        self.stage_grid.setContentsMargins(10, 10, 10, 10)
+        self.stage_grid.setSpacing(10)
+
+        # 3D-Ansicht
+        self.gl = gl.GLViewWidget()
+        self.gl.setBackgroundColor(QColor("#07090b"))
+        self.gl.opts["fov"] = 55
+        self.scatter = gl.GLScatterPlotItem(pos=np.zeros((1, 3), np.float32), size=2.0,
+                                            color=np.zeros((1, 4), np.float32), pxMode=True)
+        self.scatter.setGLOptions("opaque")
+        self.gl.addItem(self.scatter)
+
+        self.grid_item = gl.GLGridItem()
+        self.grid_item.setSize(8, 8)
+        self.grid_item.setSpacing(0.25, 0.25)
+        self.grid_item.setColor((25, 211, 197, 70))
+        self.grid_item.translate(0, 4, -0.6)
+        self.gl.addItem(self.grid_item)
+
+        # Kamerasymbol mit Sichtkegel (D415 ca. 65° x 40°)
+        d = 0.35
+        hx, hz = np.tan(np.radians(32.5)) * d, np.tan(np.radians(20)) * d
+        corners = [(-hx, d, hz), (hx, d, hz), (hx, d, -hz), (-hx, d, -hz)]
+        seg = []
+        for c in corners:
+            seg += [(0, 0, 0), c]
+        for i in range(4):
+            seg += [corners[i], corners[(i + 1) % 4]]
+        bx, by, bz = 0.05, 0.01, 0.0115
+        box = [(-bx, -by, -bz), (bx, -by, -bz), (bx, by, -bz), (-bx, by, -bz),
+               (-bx, -by, bz), (bx, -by, bz), (bx, by, bz), (-bx, by, bz)]
+        for a, b in ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)):
+            seg += [box[a], box[b]]
+        self.frustum = gl.GLLinePlotItem(pos=np.array(seg, np.float32), mode="lines",
+                                         color=(1.0, 0.69, 0.0, 0.75), width=1.5, antialias=True)
+        self.axes = gl.GLAxisItem(size=pg.Vector(0.12, 0.12, 0.12))
+        self.gl.addItem(self.frustum)
+        self.gl.addItem(self.axes)
+        self.gl.installEventFilter(self)
+        self.gl.setCameraPosition(pos=pg.Vector(0, 1.4, 0), distance=3.3, elevation=22, azimuth=-125)
+
+        self.colorbar = ColorBar()
+        holder = QWidget()
+        hl = QHBoxLayout(holder)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(6)
+        hl.addWidget(self.gl, 1)
+        hl.addWidget(self.colorbar)
+
+        self.nosignal = QWidget()
+        nl = QVBoxLayout(self.nosignal)
+        nl.addStretch()
+        t = make_label("KEIN SIGNAL", "noSignalTitle")
+        t.setAlignment(Qt.AlignCenter)
+        self.nosignal_text = make_label("Warte auf Kamera …", "noSignalText")
+        self.nosignal_text.setAlignment(Qt.AlignCenter)
+        self.nosignal_text.setWordWrap(True)
+        nl.addWidget(t)
+        nl.addWidget(self.nosignal_text)
+        nl.addStretch()
+
+        self.stack3d = QStackedWidget()
+        self.stack3d.addWidget(holder)
+        self.stack3d.addWidget(self.nosignal)
+
+        self.pane3d = Pane("PUNKTWOLKE · 3D", self.stack3d)
+        self.pane3d.hud_right.setText("LINKS DREHEN · MITTE VERSCHIEBEN · RAD ZOOM")
+        self.badge_demo = self.pane3d.add_badge("DEMO-SZENE")
+        self.badge_frozen = self.pane3d.add_badge("EINGEFROREN", "badgeTeal")
+
+        self.view_depth = ImageView()
+        self.view_depth.hovered.connect(self._on_hover)
+        self.view_depth.left.connect(lambda: self._on_hover(-1, -1))
+        self.pane_depth = Pane("TIEFENBILD", self.view_depth)
+        self.pane_depth.hud_right.setText("MAUS: ENTFERNUNG")
+        self.view_color = ImageView()
+        self.pane_color = Pane("FARBBILD · AUSGERICHTET", self.view_color)
+        return stage
+
+    def _build_statusbar(self):
+        bar = QFrame()
+        bar.setObjectName("statusbar")
+        bar.setFixedHeight(28)
+        h = QHBoxLayout(bar)
+        h.setContentsMargins(14, 0, 14, 0)
+        h.setSpacing(18)
+        self.status_msg = make_label("Starte …", "statusMsg")
+        h.addWidget(self.status_msg, 1)
+        self.status_pts = make_label("", "statusDim")
+        h.addWidget(self.status_pts)
+        h.addWidget(make_label(f"{APP_NAME} v{APP_VERSION}", "statusDim"))
+        self._flash_until = 0
+        return bar
+
+    def _build_shortcuts(self):
+        def act(key, fn):
+            a = QAction(self)
+            a.setShortcut(QKeySequence(key))
+            a.setShortcutContext(Qt.ApplicationShortcut)
+            a.triggered.connect(fn)
+            self.addAction(a)
+        act("Space", lambda: self.btn_freeze.toggle())
+        act("Ctrl+S", self.save_ply)
+        act("Ctrl+P", self.save_png)
+        act("F11", lambda: self.showNormal() if self.isFullScreen() else self.showFullScreen())
+        act("1", lambda: self.set_view("3d", True))
+        act("2", lambda: self.set_view("tiefe", True))
+        act("3", lambda: self.set_view("farbe", True))
+        act("4", lambda: self.set_view("geteilt", True))
+
+    # ------------------------------------------------------------ Einstellungen
+    def _load_settings(self):
+        self._updating_ui = True
+
+        def sel(combo, value):
+            i = combo.findData(value)
+            combo.setCurrentIndex(i if i >= 0 else 0)
+        sel(self.sel_res, cfg_get("kamera", "aufloesung"))
+        sel(self.sel_fps, cfg_get("kamera", "fps"))
+        sel(self.sel_mode, cfg_get("kamera", "demo_modus"))
+        self.chk_laser.setChecked(truthy(cfg_get("kamera", "laser")))
+        self.rng_laser.setValue(int(float(cfg_get("kamera", "laserleistung") or 150)))
+        self.lbl_laser.setText(f"{self.rng_laser.value()} mW")
+        self.seg_step.set_value(cfg_get("verarbeitung", "punktabstand"))
+        self.chk_spatial.setChecked(truthy(cfg_get("verarbeitung", "spatial_filter")))
+        self.chk_temporal.setChecked(truthy(cfg_get("verarbeitung", "temporal_filter")))
+        self.chk_holes.setChecked(truthy(cfg_get("verarbeitung", "loecher_fuellen")))
+        self.min_d = float(cfg_get("verarbeitung", "min_distanz_m") or 0.15)
+        self.max_d = float(cfg_get("verarbeitung", "max_distanz_m") or 3.0)
+        self.rng_min.setValue(int(round(self.min_d * 100)))
+        self.rng_max.setValue(int(round(self.max_d * 10)))
+        self.color_mode = cfg_get("ansicht", "farbmodus")
+        self.seg_color.set_value(self.color_mode)
+        self.point_size = float(cfg_get("ansicht", "punktgroesse") or 2)
+        self.rng_size.setValue(int(round(self.point_size * 2)))
+        self.chk_grid.setChecked(truthy(cfg_get("ansicht", "gitter")))
+        self.chk_axes.setChecked(truthy(cfg_get("ansicht", "achsen")))
+        self._updating_ui = False
+        self._apply_local()
+        self.set_view(cfg_get("ansicht", "ansicht") or "3d", False)
+
+    def _set(self, section, key, value, restart=False, live=None):
+        if self._updating_ui:
+            return
+        old = cfg_get(section, key)
+        cfg_set(section, key, value)
+        self.save_timer.start()
+        if restart and old != cfg_get(section, key):
+            self.cam.request_restart()
+            self.flash("Kamera wird mit neuen Einstellungen neu gestartet …")
+        if live:
+            self.cam.queue_option(*live)
+
+    def _on_range(self):
+        if self._updating_ui:
+            return
+        self.min_d = self.rng_min.value() / 100
+        self.max_d = self.rng_max.value() / 10
+        if self.max_d <= self.min_d + 0.1:
+            self.max_d = self.min_d + 0.1
+        cfg_set("verarbeitung", "min_distanz_m", f"{self.min_d:.2f}")
+        cfg_set("verarbeitung", "max_distanz_m", f"{self.max_d:.1f}")
+        self.save_timer.start()
+        self._apply_local()
+        self._rerender()
+
+    def _on_color(self, v):
+        self.color_mode = v
+        self._set("ansicht", "farbmodus", v)
+        self._apply_local()
+        self._rerender()
+
+    def _on_size(self, v):
+        self.point_size = v / 2
+        self._set("ansicht", "punktgroesse", self.point_size)
+        self._apply_local()
+        self._rerender()
+
+    def _on_helpers(self):
+        self._set("ansicht", "gitter", self.chk_grid.isChecked())
+        self._set("ansicht", "achsen", self.chk_axes.isChecked())
+        self._apply_local()
+
+    def _on_cam_preset(self, v):
+        self.set_cam_preset(v)
+        QTimer.singleShot(600, lambda: self.seg_cam.set_value(""))
+
+    def _on_freeze(self, on):
+        self.frozen = on
+        self.btn_freeze.setText("FORTSETZEN" if on else "EINFRIEREN")
+        self.badge_frozen.setVisible(on)
+
+    def _apply_local(self):
+        self.lbl_min.setText(f"{self.min_d:.2f} m")
+        self.lbl_max.setText(f"{self.max_d:.1f} m")
+        self.lbl_size.setText(f"{self.point_size:.1f} px")
+        self.grid_item.setVisible(self.chk_grid.isChecked())
+        helpers = self.chk_axes.isChecked() and not getattr(self, "in_cam_view", False)
+        self.frustum.setVisible(helpers)
+        self.axes.setVisible(helpers)
+        self.colorbar.setVisible(self.color_mode == "tiefe")
+        self.colorbar.set_range(self.min_d, self.max_d)
+
+    def _open_folder(self):
+        path = str(BASE_DIR)
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)  # noqa: S606
+            elif sys.platform == "darwin":
+                os.system(f'open "{path}"')
+            else:
+                os.system(f'xdg-open "{path}" >/dev/null 2>&1 &')
+        except Exception as exc:
+            self.flash(f"Ordner konnte nicht geöffnet werden: {exc}", warn=True)
+
+    # ---------------------------------------------------------------- Ansicht
+    def set_view(self, v, persist):
+        if v not in ("3d", "tiefe", "farbe", "geteilt"):
+            v = "3d"
+        self.view = v
+        self.tabs.set_value(v)
+        g = self.stage_grid
+        for w in (self.pane3d, self.pane_depth, self.pane_color):
+            g.removeWidget(w)
+            w.hide()
+        for i in range(3):
+            g.setRowStretch(i, 0)
+            g.setColumnStretch(i, 0)
+        if v == "3d":
+            g.addWidget(self.pane3d, 0, 0)
+        elif v == "tiefe":
+            g.addWidget(self.pane_depth, 0, 0)
+        elif v == "farbe":
+            g.addWidget(self.pane_color, 0, 0)
+        else:
+            g.addWidget(self.pane3d, 0, 0, 2, 1)
+            g.addWidget(self.pane_depth, 0, 1)
+            g.addWidget(self.pane_color, 1, 1)
+            g.setColumnStretch(0, 2)
+            g.setColumnStretch(1, 1)
+            g.setRowStretch(0, 1)
+            g.setRowStretch(1, 1)
+        for w in (self.pane3d, self.pane_depth, self.pane_color):
+            if g.indexOf(w) >= 0:
+                w.show()
+        if persist:
+            self._set("ansicht", "ansicht", v)
+        self._rerender()
+
+    def set_cam_preset(self, name):
+        c, dist, elev, azim = CAM_PRESETS.get(name, CAM_PRESETS["schraeg"])
+        self.gl.setCameraPosition(pos=pg.Vector(*c), distance=dist, elevation=elev, azimuth=azim)
+        # Aus Sicht der Kamera selbst das Kamerasymbol ausblenden, bis wieder gedreht wird
+        self.in_cam_view = (name == "kamera")
+        self._apply_local()
+
+    def eventFilter(self, obj, ev):
+        from PySide6.QtCore import QEvent
+        if obj is self.gl and ev.type() == QEvent.MouseButtonPress and getattr(self, "in_cam_view", False):
+            self.in_cam_view = False
+            self._apply_local()
+        return super().eventFilter(obj, ev)
+
+    # ------------------------------------------------------------- Rendering
+    def _poll_frame(self):
+        if self.frozen:
+            return
+        f = self.cam.latest()
+        if f is None or f.seq == self.last_seq:
+            return
+        self.last_seq = f.seq
+        self.render(f)
+
+    def _rerender(self):
+        if self.last is not None:
+            self.render(self.last)
+
+    def _get_rays(self, f):
+        h, w = f.depth.shape
+        key = (w, h, f.fx, f.fy, f.ppx, f.ppy)
+        if key != self.rays_key:
+            u, v = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+            self.rays = (((u - f.ppx) / f.fx).ravel(), ((v - f.ppy) / f.fy).ravel())
+            self.rays_key = key
+        return self.rays
+
+    def build_cloud(self, f):
+        rx, ry = self._get_rays(f)
+        raw = f.depth.ravel()
+        z = raw.astype(np.float32) * f.units
+        m = (raw > 0) & (z >= self.min_d) & (z <= self.max_d)
+        zz = z[m]
+        n = zz.size
+        pos = np.empty((n, 3), np.float32)
+        pos[:, 0] = rx[m] * zz
+        pos[:, 1] = zz
+        pos[:, 2] = -ry[m] * zz
+        col = np.ones((n, 4), np.float32)
+        mode = self.color_mode
+        if mode == "rgb" and f.rgb is None:
+            mode = "tiefe"
+        span = max(1e-6, self.max_d - self.min_d)
+        if mode == "rgb":
+            col[:, :3] = f.rgb.reshape(-1, 3)[m].astype(np.float32) * (1 / 255)
+        elif mode == "tiefe":
+            idx = ((1 - (zz - self.min_d) / span) * 255).astype(np.int32)
+            col[:, :3] = TURBO_F[np.clip(idx, 0, 255)]
+        else:
+            base = TEAL_F if mode == "teal" else AMBER_F
+            b = np.clip(1.05 - 0.75 * (zz - self.min_d) / span, 0, 1)[:, None]
+            col[:, :3] = base[None, :] * b
+        self.cloud_pos, self.cloud_col = pos, col
+        self.mean_z = float(zz.mean()) if n else 0.0
+        return n
+
+    def depth_image(self, f):
+        h, w = f.depth.shape
+        z = f.depth.astype(np.float32) * f.units
+        t = (z - self.min_d) / max(1e-6, self.max_d - self.min_d)
+        idx = np.clip(((1 - t) * 255).astype(np.int32), 0, 255)
+        rgb = TURBO_U8[idx]
+        rgb[(t < 0) | (t > 1)] = (12, 14, 17)
+        rgb[f.depth == 0] = (0, 0, 0)
+        rgb = np.ascontiguousarray(rgb)
+        img = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+        return img
+
+    def render(self, f):
+        self.last = f
+        show3d = self.view in ("3d", "geteilt")
+        if show3d:
+            n = self.build_cloud(f)
+            if n:
+                self.scatter.setData(pos=self.cloud_pos, color=self.cloud_col, size=self.point_size)
+            else:
+                self.scatter.setData(pos=np.zeros((1, 3), np.float32), color=np.zeros((1, 4), np.float32))
+            self.pane3d.hud.setText(f"PUNKTE {n:,} · Ø {self.mean_z:.2f} m · BEREICH {self.min_d:.2f}–{self.max_d:.2f} m"
+                                    .replace(",", "."))
+            self.status_pts.setText(f"{n:,} Punkte".replace(",", "."))
+        h, w = f.depth.shape
+        if self.view in ("tiefe", "geteilt"):
+            self.view_depth.set_image(self.depth_image(f))
+            if not self.hover_text:
+                self.pane_depth.hud.setText(f"{w}×{h} · {self.min_d:.2f}–{self.max_d:.2f} m")
+        if self.view in ("farbe", "geteilt"):
+            if f.rgb is not None:
+                img = QImage(f.rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
+                self.view_color.set_image(img)
+                self.pane_color.hud.setText(f"{w}×{h} · AUF TIEFE AUSGERICHTET")
+            else:
+                self.view_color.set_image(None)
+                self.pane_color.hud.setText("KEIN FARBSTROM")
+        self.badge_demo.setVisible(bool(f.demo))
+        self.stack3d.setCurrentIndex(0)
+        self.pill_fps.setText(f"{f.fps:.1f} FPS")
+
+    def _on_hover(self, u, v):
+        f = self.last
+        if f is None or u < 0:
+            self.hover_text = None
+            if f is not None:
+                h, w = f.depth.shape
+                self.pane_depth.hud.setText(f"{w}×{h} · {self.min_d:.2f}–{self.max_d:.2f} m")
+            return
+        raw = int(f.depth[v, u])
+        self.hover_text = (f"PIXEL {u},{v} · {raw * f.units:.3f} m" if raw else f"PIXEL {u},{v} · KEIN WERT")
+        self.pane_depth.hud.setText(self.hover_text)
+
+    # --------------------------------------------------------------- Status
+    def _poll_status(self):
+        st = self.cam.get_status()
+        if st["verbunden"]:
+            state, text = "ok", "● VERBUNDEN"
+        elif st["demo"]:
+            state, text = "demo", "● DEMO"
+        else:
+            state, text = "err", "● GETRENNT"
+        if self.pill_cam.property("state") != state:
+            self.pill_cam.setProperty("state", state)
+            self.pill_cam.style().unpolish(self.pill_cam)
+            self.pill_cam.style().polish(self.pill_cam)
+        self.pill_cam.setText(text)
+
+        g = st.get("geraet") or {}
+        usb = g.get("usb") or ""
+        self.kv["name"].setText(g.get("name") or "—")
+        self.kv["seriennummer"].setText(g.get("seriennummer") or "—")
+        self.kv["firmware"].setText(g.get("firmware") or "—")
+        self.kv["usb"].setText((usb + ("  ⚠ USB 2" if usb.startswith("2") else "")) or "—")
+        self.kv["stream"].setText(st.get("aufloesung") or "—")
+        self.kv["temp"].setText(f"{st['temperatur']} °C" if st.get("temperatur") is not None else "—")
+        self.kv["sdk"].setText(st.get("sdk") or ("FEHLT" if st.get("sdk_fehler") else "—"))
+        if time.time() > self._flash_until:
+            self.status_msg.setStyleSheet("")
+            self.status_msg.setText(st.get("meldung") or "")
+
+        o = st.get("optionen") or {}
+        has = bool(st["verbunden"] and o)
+        self.cam_opts.setEnabled(has)
+        self.cam_hint.setVisible(not has)
+        sig = repr(sorted(o.items())) if has else None
+        if has and sig != self._opt_sig and not self.rng_laser.isSliderDown():
+            self._opt_sig = sig
+            self._updating_ui = True
+            if "laser" in o:
+                self.chk_laser.setChecked(bool(o["laser"]))
+            if "laserleistung" in o:
+                self.rng_laser.setRange(int(o["laserleistung_min"]), int(o["laserleistung_max"]))
+                self.rng_laser.setSingleStep(int(o.get("laserleistung_step") or 30))
+                self.rng_laser.setValue(int(o["laserleistung"]))
+                self.lbl_laser.setText(f"{int(o['laserleistung'])} mW")
+            if o.get("presets"):
+                self.sel_preset.clear()
+                self.sel_preset.addItems(o["presets"])
+                if o.get("preset"):
+                    self.sel_preset.setCurrentText(o["preset"])
+            self._updating_ui = False
+
+        if not st["verbunden"] and not st["demo"] and not self.frozen:
+            self.nosignal_text.setText(st.get("meldung") or "Warte auf Kamera …")
+            self.stack3d.setCurrentIndex(1)
+            self.pill_fps.setText("— FPS")
+            self.badge_demo.hide()
+            self.pane3d.hud.setText("—")
+            self.status_pts.setText("")
+            if self.last is not None and self.cam.latest() is None:
+                self.last = None
+                self.view_depth.set_image(None)
+                self.view_color.set_image(None)
+                self.pane_depth.hud.setText("KEIN SIGNAL")
+                self.pane_color.hud.setText("KEIN SIGNAL")
+
+    def _tick_clock(self):
+        self.clock.setText(time.strftime("%H:%M:%S"))
+
+    def flash(self, text, warn=False):
+        self._flash_until = time.time() + 3
+        self.status_msg.setStyleSheet(f"color: {AMBER if warn else TEAL};")
+        self.status_msg.setText(text)
+
+    # --------------------------------------------------------------- Export
+    def _default_dir(self):
+        from PySide6.QtCore import QStandardPaths
+        d = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+        return d or str(BASE_DIR)
+
+    def save_png(self):
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path, _ = QFileDialog.getSaveFileName(self, "Bild speichern",
+                                              str(Path(self._default_dir()) / f"realsense_{stamp}.png"),
+                                              "PNG-Bild (*.png)")
+        if not path:
+            return
+        if self.view == "tiefe" and self.view_depth.img is not None:
+            img = self.view_depth.img
+        elif self.view == "farbe" and self.view_color.img is not None:
+            img = self.view_color.img
+        else:
+            img = self.gl.grabFramebuffer()
+        if img.save(path):
+            self.flash(f"Bild gespeichert: {path}")
+        else:
+            self.flash("Bild konnte nicht gespeichert werden", warn=True)
+
+    def save_ply(self):
+        if self.last is None:
+            return self.flash("Noch keine Daten", warn=True)
+        n = self.build_cloud(self.last)
+        if not n:
+            return self.flash("Keine Punkte im eingestellten Bereich", warn=True)
+        pos = self.cloud_pos.copy()
+        col = (np.clip(self.cloud_col[:, :3], 0, 1) * 255).astype(np.uint8)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path, _ = QFileDialog.getSaveFileName(self, "Punktwolke speichern",
+                                              str(Path(self._default_dir()) / f"punktwolke_{stamp}.ply"),
+                                              "PLY-Punktwolke (*.ply)")
+        if not path:
+            return
+        # Koordinaten wie in der Ansicht: Meter, Z nach oben, Kamera blickt in +Y
+        dt = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("r", "u1"), ("g", "u1"), ("b", "u1")])
+        arr = np.empty(n, dt)
+        arr["x"], arr["y"], arr["z"] = pos[:, 0], pos[:, 1], pos[:, 2]
+        arr["r"], arr["g"], arr["b"] = col[:, 0], col[:, 1], col[:, 2]
+        header = ("ply\nformat binary_little_endian 1.0\n"
+                  f"comment {APP_NAME} v{APP_VERSION} - Meter, Z nach oben, Kamera blickt in +Y\n"
+                  f"element vertex {n}\nproperty float x\nproperty float y\nproperty float z\n"
+                  "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+        try:
+            with open(path, "wb") as fh:
+                fh.write(header.encode("ascii"))
+                fh.write(arr.tobytes())
+            self.flash(f"{n:,} Punkte gespeichert: {path}".replace(",", "."))
+        except Exception as exc:
+            QMessageBox.warning(self, APP_NAME, f"Speichern fehlgeschlagen:\n{exc}")
+
+    # ---------------------------------------------------------------- Fenster
+    def closeEvent(self, e):
+        cfg_set("fenster", "maximiert", self.isMaximized())
+        if not self.isMaximized() and not self.isFullScreen():
+            cfg_set("fenster", "breite", self.width())
+            cfg_set("fenster", "hoehe", self.height())
+        cfg_save()
+        self.cam.stop()
+        super().closeEvent(e)
+
+
+def dark_titlebar(win):
+    """Dunkle Titelleiste unter Windows 10/11."""
+    if not sys.platform.startswith("win"):
+        return
     try:
-        app.run(host=host, port=ACTIVE_PORT, threaded=True, use_reloader=False)
-    except OSError as exc:
-        print(f"\nFEHLER: Port {ACTIVE_PORT} ist belegt oder nicht verfügbar ({exc}).")
-        print(f"Bitte in {CONFIG_PATH} unter [server] einen anderen Port eintragen.")
-        if getattr(sys, "frozen", False):
-            input("Enter zum Beenden …")
+        import ctypes
+        hwnd = int(win.winId())
+        val = ctypes.c_int(1)
+        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (neu / alt)
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val)) == 0:
+                break
+        # Rahmenfarbe (Windows 11)
+        color = ctypes.c_int(0x00110E0B)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(color), ctypes.sizeof(color))
+    except Exception:
+        pass
+
+
+def main():
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"{APP_NAME}.{APP_VERSION}")
+        except Exception:
+            pass
+    QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+    app.setStyle("Fusion")
+    app.setStyleSheet(QSS)
+    if (ASSET_DIR / "icon.png").exists():
+        app.setWindowIcon(QIcon(str(ASSET_DIR / "icon.png")))
+
+    def excepthook(t, v, tb):
+        import traceback
+        msg = "".join(traceback.format_exception(t, v, tb))
+        log.error(msg)
+        QMessageBox.critical(None, APP_NAME, f"Unerwarteter Fehler:\n\n{v}\n\nDetails in {LOG_PATH}")
+    sys.excepthook = excepthook
+
+    log.info("%s v%s startet – Konfig %s", APP_NAME, APP_VERSION, CONFIG_PATH)
+    cam = CameraWorker()
+    cam.start()
+    win = MainWindow(cam)
+    try:
+        win.resize(int(cfg_get("fenster", "breite")), int(cfg_get("fenster", "hoehe")))
+    except ValueError:
+        win.resize(1480, 880)
+    dark_titlebar(win)
+    if truthy(cfg_get("fenster", "maximiert")):
+        win.showMaximized()
+    else:
+        win.show()
+    rc = app.exec()
+    cam.stop()
+    return rc
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
