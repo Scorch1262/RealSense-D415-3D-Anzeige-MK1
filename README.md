@@ -1,6 +1,6 @@
 # RealSense-Viewer-MK1
 
-**Version 2.0.0** · reines Desktop-Programm für Windows (kein Browser, kein Webserver)
+**Version 2.0.1** · reines Desktop-Programm für Windows (kein Browser, kein Webserver)
 
 Zeigt das 3D-Bild (Punktwolke) einer per USB angeschlossenen **Intel RealSense D415** live in einem eigenen Programmfenster an – im Design der Dashboards (dunkel, Amber/Teal, Lattice-Stil). Dazu kommen das Tiefenbild mit Farbskala und das auf die Tiefe ausgerichtete Farbbild.
 
@@ -37,7 +37,13 @@ Zeigt das 3D-Bild (Punktwolke) einer per USB angeschlossenen **Intel RealSense D
 
 Ein separater Treiber ist nicht nötig – die RealSense-Bibliothek steckt in der exe. Wird die Kamera nicht erkannt: Kabel/Port wechseln, andere Programme schließen, die die Kamera benutzen (z. B. Intel RealSense Viewer), dann **„Kamera neu verbinden“** klicken.
 
-Probleme werden in `realsense-viewer.log` neben der exe protokolliert.
+Probleme werden in `realsense-viewer.log` neben der exe protokolliert – dort stehen auch alle Formate, die die Kamera anbietet, und welches gewählt wurde.
+
+### Kamera wird erkannt, aber kein Bild
+
+- **USB 2 statt USB 3:** Im Feld *USB* steht dann `2.x`. Die D415 schafft an USB 2 nur kleine Auflösungen (z. B. 640×480 @ 30). Das Programm wählt automatisch ein passendes Format; für volle Auflösung einen USB-3-Port (blau / SS) und ein USB-3-fähiges Kabel nutzen – viele USB-C-Kabel sind nur USB 2.
+- **Windows-Datenschutz:** *Einstellungen → Datenschutz & Sicherheit → Kamera* → „Kamerazugriff“ und „Desktop-Apps den Zugriff auf die Kamera erlauben“ einschalten.
+- **Kamera belegt:** Intel RealSense Viewer, Teams, OBS o. Ä. schließen.
 
 ## config.ini
 
@@ -58,7 +64,7 @@ Wird beim ersten Start neben der exe angelegt.
 
 1. Inhalt dieser Zip in ein GitHub-Repository hochladen (inkl. Ordner `.github`).
 2. Bei jedem Push auf `main`/`master` baut der Workflow **Build Windows EXE** die exe mit PyInstaller, startet sie mit `--selbsttest` und stellt sie als Artefakt bereit (Reiter *Actions* → Lauf → *Artifacts*).
-3. Für ein Release einen Tag setzen, z. B. `git tag v2.0.0 && git push --tags` – dann erscheint die fertige Zip unter *Releases*.
+3. Für ein Release einen Tag setzen, z. B. `git tag v2.0.1 && git push --tags` – dann erscheint die fertige Zip unter *Releases*.
 
 Die Versionsnummer steht in `app.py` (`APP_VERSION`) und wird automatisch in exe-Eigenschaften, Zip-Namen und Fenster übernommen.
 

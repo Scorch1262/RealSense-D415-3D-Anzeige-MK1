@@ -129,6 +129,66 @@ if not CONFIG_PATH.exists():
 # --------------------------------------------------------------------------
 # Kamera-Thread
 # --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# Profil-Auswahl
+# --------------------------------------------------------------------------
+def _info(dev, key):
+    try:
+        return dev.get_info(key) if dev.supports(key) else ""
+    except Exception:
+        return ""
+
+
+def list_profiles(dev):
+    """Liefert (tiefe, farbe) als Listen von (breite, hoehe, fps, format)."""
+    depth, color = set(), set()
+    color_ok = {rs.format.rgb8: 0, rs.format.bgr8: 1}
+    for s in dev.query_sensors():
+        try:
+            profiles = s.get_stream_profiles()
+        except Exception as exc:
+            log.warning("Sensorprofile nicht lesbar: %s", exc)
+            continue
+        for p in profiles:
+            if not p.is_video_stream_profile():
+                continue
+            vp = p.as_video_stream_profile()
+            entry = (vp.width(), vp.height(), p.fps(), p.format())
+            if p.stream_type() == rs.stream.depth and p.format() == rs.format.z16:
+                depth.add(entry)
+            elif p.stream_type() == rs.stream.color and p.format() in color_ok:
+                color.add(entry)
+    return sorted(depth, key=lambda e: (-e[0] * e[1], -e[2])), \
+        sorted(color, key=lambda e: (-e[0] * e[1], -e[2]))
+
+
+def choose_profile(profiles, w, h, fps, prefer_rgb=False):
+    """Wählt das Profil, das Wunschauflösung und -bildrate am nächsten kommt.
+    Exakte Auflösung gewinnt, solange sie mindestens die halbe Wunsch-Bildrate schafft;
+    sonst zählt zuerst die Bildrate, dann die Nähe der Auflösung."""
+    want_px = w * h
+
+    def score(p):
+        pw, ph, pf, fmt = p
+        res = abs(pw * ph - want_px) / max(want_px, 1)
+        exact = 0 if (pw, ph) == (w, h) and pf >= fps * 0.5 else 1
+        fps_pen = 0 if pf == fps else (1 + (fps - pf) / max(fps, 1) if pf < fps else 2 + (pf - fps))
+        fmt_pen = 0 if (not prefer_rgb or rs is None or fmt == rs.format.rgb8) else 1
+        return (exact, fps_pen, res, fmt_pen)
+    return min(profiles, key=score)
+
+
+def fmt_profiles(profiles):
+    out = []
+    for p in profiles:
+        if p is None:
+            continue
+        name = str(p[3]).split(".")[-1]
+        out.append(f"{p[0]}x{p[1]}@{p[2]}({name})")
+    return ", ".join(out)
+
+
 class Frame:
     __slots__ = ("seq", "depth", "rgb", "fx", "fy", "ppx", "ppy", "units", "demo", "fps")
 
@@ -241,70 +301,104 @@ class CameraWorker(threading.Thread):
                 continue
             try:
                 self._run_camera()
+                self._last_err = None
             except Exception as exc:
-                log.error("Kamerafehler: %s", exc)
-                self._set_status(verbunden=False, meldung=f"Kamerafehler: {exc}")
-                self._idle(2.0)
+                if str(exc) != getattr(self, "_last_err", None):
+                    self._last_err = str(exc)
+                    log.error("Kamerafehler: %s", exc)
+                self._set_status(verbunden=False, demo=False, meldung=f"Kamerafehler: {exc}")
+                with self.lock:
+                    self.frame = None
+                self._idle(3.0)
 
     # ---------------- echte Kamera ----------------
     def _run_camera(self):
         try:
-            w, h = [int(x) for x in cfg_get("kamera", "aufloesung").lower().split("x")]
+            want_w, want_h = [int(x) for x in cfg_get("kamera", "aufloesung").lower().split("x")]
         except Exception:
-            w, h = 848, 480
-        fps = int(float(cfg_get("kamera", "fps") or 30))
-        serial = cfg_get("kamera", "seriennummer").strip()
+            want_w, want_h = 848, 480
+        want_fps = int(float(cfg_get("kamera", "fps") or 30))
+        serial_cfg = cfg_get("kamera", "seriennummer").strip()
 
-        def new_cfg():
-            c = rs.config()
-            if serial:
-                c.enable_device(serial)
-            return c
+        # 1) Gerät auswählen und Infos lesen (auch wenn der Start später scheitert)
+        devs = list(rs.context().query_devices())
+        dev = None
+        for d in devs:
+            if not serial_cfg or _info(d, rs.camera_info.serial_number) == serial_cfg:
+                dev = d
+                break
+        if dev is None:
+            raise RuntimeError(f"Kamera mit Seriennummer {serial_cfg} nicht gefunden")
+        geraet = {
+            "name": _info(dev, rs.camera_info.name),
+            "seriennummer": _info(dev, rs.camera_info.serial_number),
+            "firmware": _info(dev, rs.camera_info.firmware_version),
+            "usb": _info(dev, rs.camera_info.usb_type_descriptor),
+        }
+        self._set_status(geraet=geraet)
+        serial = geraet["seriennummer"]
+
+        # 2) Tatsächlich angebotene Bildformate abfragen
+        depth_list, color_list = list_profiles(dev)
+        sig = (serial, len(depth_list), len(color_list), geraet["usb"])
+        if sig != getattr(self, "_last_diag", None):
+            self._last_diag = sig
+            log.info("Kamera: %s  SN %s  FW %s  USB %s", *geraet.values())
+            log.info("Tiefenformate (z16): %s", fmt_profiles(depth_list) or "KEINE")
+            log.info("Farbformate: %s", fmt_profiles(color_list) or "KEINE")
+        if not depth_list:
+            raise RuntimeError(
+                "Kamera erkannt, liefert aber keine Tiefenformate. Mögliche Ursachen: Windows-Datenschutz "
+                "(Einstellungen → Datenschutz → Kamera → Desktop-Apps Zugriff erlauben), Kamera wird von einem "
+                "anderen Programm benutzt, oder USB-Problem – Kamera ab- und wieder anstecken.")
+
+        # 3) Bestes passendes Profil wählen und prüfen, ob das SDK es auflösen kann
+        d_choice = choose_profile(depth_list, want_w, want_h, want_fps)
+        c_candidates = [c for c in color_list if c[2] == d_choice[2]]
+        c_choice = choose_profile(c_candidates, d_choice[0], d_choice[1], d_choice[2], prefer_rgb=True) \
+            if c_candidates else None
 
         pipeline = rs.pipeline()
-        config = new_cfg()
-        config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
-        config.enable_stream(rs.stream.color, w, h, rs.format.rgb8, fps)
-        self._set_status(meldung=f"Verbinde mit Kamera ({w}x{h} @ {fps} fps) …")
-        has_color = True
-        try:
-            profile = pipeline.start(config)
-        except Exception as exc:
-            log.warning("Start mit Farbe fehlgeschlagen (%s) – nur Tiefe", exc)
+        wrapper = rs.pipeline_wrapper(pipeline)
+
+        def build(with_color):
+            c = rs.config()
+            c.enable_device(serial)
+            c.enable_stream(rs.stream.depth, d_choice[0], d_choice[1], rs.format.z16, d_choice[2])
+            if with_color and c_choice:
+                c.enable_stream(rs.stream.color, c_choice[0], c_choice[1], c_choice[3], c_choice[2])
+            return c
+
+        has_color = c_choice is not None
+        config = build(has_color)
+        if not config.can_resolve(wrapper):
+            log.warning("Kombination Tiefe %s + Farbe %s nicht auflösbar – nur Tiefe",
+                        fmt_profiles([d_choice]), fmt_profiles([c_choice]) if c_choice else "-")
             has_color = False
-            config = new_cfg()
-            config.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
-            try:
-                profile = pipeline.start(config)
-            except Exception:
-                config = new_cfg()
-                config.enable_stream(rs.stream.depth, rs.format.z16)
-                profile = pipeline.start(config)
+            config = build(False)
+            if not config.can_resolve(wrapper):
+                raise RuntimeError(f"SDK kann Tiefenformat {fmt_profiles([d_choice])} nicht öffnen")
+
+        self._set_status(meldung=f"Verbinde mit Kamera ({d_choice[0]}x{d_choice[1]} @ {d_choice[2]} fps) …")
+        profile = pipeline.start(config)
+        log.info("Gestartet: Tiefe %s, Farbe %s", fmt_profiles([d_choice]),
+                 fmt_profiles([c_choice]) if has_color else "aus")
+        color_bgr = has_color and c_choice[3] == rs.format.bgr8
+        fps = d_choice[2]
 
         dev = profile.get_device()
         sensor = dev.first_depth_sensor()
         units = sensor.get_depth_scale()
-
-        def info(key):
-            try:
-                return dev.get_info(key) if dev.supports(key) else ""
-            except Exception:
-                return ""
-
-        geraet = {
-            "name": info(rs.camera_info.name),
-            "seriennummer": info(rs.camera_info.serial_number),
-            "firmware": info(rs.camera_info.firmware_version),
-            "usb": info(rs.camera_info.usb_type_descriptor),
-        }
-        log.info("Kamera: %s SN %s FW %s USB %s", *geraet.values())
+        abweichung = ""
+        if (d_choice[0], d_choice[1], d_choice[2]) != (want_w, want_h, want_fps):
+            abweichung = f" – {want_w}x{want_h} @ {want_fps} nicht verfügbar, nutze {d_choice[0]}x{d_choice[1]} @ {d_choice[2]}"
         self._apply_initial_options(sensor)
 
         intr = profile.get_stream(rs.stream.depth).as_video_stream_profile().get_intrinsics()
         align = rs.align(rs.stream.depth) if has_color else None
         spatial, temporal, holes = rs.spatial_filter(), rs.temporal_filter(), rs.hole_filling_filter()
 
-        hint = " – Achtung: nur USB 2 erkannt" if geraet["usb"].startswith("2") else ""
+        hint = (" – Achtung: nur USB 2 erkannt" if geraet["usb"].startswith("2") else "") + abweichung
         self._set_status(verbunden=True, demo=False, geraet=geraet,
                          aufloesung=f"{intr.width}x{intr.height} @ {fps} fps" + ("" if has_color else " (ohne Farbe)"),
                          meldung="Kamera läuft" + hint, optionen=self._read_options(sensor))
@@ -331,6 +425,8 @@ class CameraWorker(threading.Thread):
 
                 d = np.asanyarray(depth.get_data())
                 rgb = np.asanyarray(color.get_data()) if color else None
+                if rgb is not None and color_bgr:
+                    rgb = rgb[..., ::-1]
                 step = self._step()
                 if step > 1:
                     d = d[::step, ::step]
