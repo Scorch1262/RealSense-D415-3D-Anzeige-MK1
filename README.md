@@ -1,8 +1,12 @@
 # RealSense-Viewer-MK1
 
-**Version 2.0.1** · reines Desktop-Programm für Windows (kein Browser, kein Webserver)
+**Version 2.0.2** · reines Desktop-Programm für Windows (kein Browser, kein Webserver)
 
 Zeigt das 3D-Bild (Punktwolke) einer per USB angeschlossenen **Intel RealSense D415** live in einem eigenen Programmfenster an – im Design der Dashboards (dunkel, Amber/Teal, Lattice-Stil). Dazu kommen das Tiefenbild mit Farbskala und das auf die Tiefe ausgerichtete Farbbild.
+
+![RealSense-Viewer-MK1 – geteilte Ansicht mit 3D-Punktwolke, Tiefenbild und Farbbild (Demo-Szene)](docs/screenshot.png)
+
+*Geteilte Ansicht: 3D-Punktwolke, Tiefenbild und ausgerichtetes Farbbild (hier mit der eingebauten Demo-Szene).*
 
 ## Funktionen
 
@@ -64,7 +68,7 @@ Wird beim ersten Start neben der exe angelegt.
 
 1. Inhalt dieser Zip in ein GitHub-Repository hochladen (inkl. Ordner `.github`).
 2. Bei jedem Push auf `main`/`master` baut der Workflow **Build Windows EXE** die exe mit PyInstaller, startet sie mit `--selbsttest` und stellt sie als Artefakt bereit (Reiter *Actions* → Lauf → *Artifacts*).
-3. Für ein Release einen Tag setzen, z. B. `git tag v2.0.1 && git push --tags` – dann erscheint die fertige Zip unter *Releases*.
+3. Für ein Release einen Tag setzen, z. B. `git tag v2.0.2 && git push --tags` – dann erscheint die fertige Zip unter *Releases*.
 
 Die Versionsnummer steht in `app.py` (`APP_VERSION`) und wird automatisch in exe-Eigenschaften, Zip-Namen und Fenster übernommen.
 
@@ -85,6 +89,7 @@ RealSense-Viewer-MK1/
 ├── kamera.py                   Kamera-Thread, Demo-Szene, config.ini
 ├── requirements.txt
 ├── assets/                     icon.ico, icon.png, logo.svg, pfeil.png
+├── docs/screenshot.png         Bild für diese README
 ├── build/make_version_info.py  Versionsressource für die exe
 └── .github/workflows/build-exe.yml
 ```

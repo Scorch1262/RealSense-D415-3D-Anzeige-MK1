@@ -1,5 +1,8 @@
 # Änderungen
 
+## 2.0.2
+- README zeigt einen Screenshot des Programms (`docs/screenshot.png`)
+
 ## 2.0.1
 - Fehler „Couldn't resolve requests“ behoben: Das Programm fragt jetzt die tatsächlich von der Kamera
   angebotenen Formate ab und wählt das passendste (z. B. an USB 2 automatisch 640×480 @ 30 statt 1280×720)
